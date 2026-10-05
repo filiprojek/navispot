@@ -1,7 +1,6 @@
 import { NavidromeApiClient } from '@/lib/navidrome/client';
 import { TrackMatch } from '@/types/matching';
 import {
-  FavoritesExportProgress,
   FavoritesExportError,
   FavoritesExportResult,
   FavoritesExporterOptions,
@@ -74,8 +73,8 @@ export class DefaultFavoritesExporter implements FavoritesExporter {
           if (!onProgress) return;
           const idx = Math.max(0, Math.min(processed - 1, matchedTracks.length - 1));
           const match = matchedTracks[idx];
-          const trackName = match.spotifyTrack.name;
-          const artistName = match.spotifyTrack.artists?.[0]?.name || 'Unknown';
+          const trackName = match.spotifyTrack?.name || match.track?.title || 'Unknown';
+          const artistName = match.spotifyTrack?.artists?.[0]?.name || match.track?.artists?.[0]?.name || 'Unknown';
           void Promise.resolve(
             onProgress({
               current: processed,
@@ -108,8 +107,8 @@ export class DefaultFavoritesExporter implements FavoritesExporter {
       for (let i = starResult.processed; i < matchedTracks.length; i++) {
         const match = matchedTracks[i];
         errors.push({
-          trackName: match.spotifyTrack.name,
-          artistName: match.spotifyTrack.artists?.[0]?.name || 'Unknown',
+          trackName: match.spotifyTrack?.name || match.track?.title || 'Unknown',
+          artistName: match.spotifyTrack?.artists?.[0]?.name || match.track?.artists?.[0]?.name || 'Unknown',
           reason,
         });
       }

@@ -20,9 +20,9 @@ const generateExportLog = (result: ResultsReportProps['result']): string => {
     options: result.options,
     statistics: result.statistics,
     tracks: result.matches.map((match: TrackMatch) => ({
-      name: match.spotifyTrack.name,
-      artist: match.spotifyTrack.artists?.map(a => a.name).join(', ') || 'Unknown',
-      album: match.spotifyTrack.album?.name || 'Unknown',
+      name: match.spotifyTrack?.name || match.track?.title || 'Unknown',
+      artist: match.spotifyTrack?.artists?.map(a => a.name).join(', ') || match.track?.artists?.map(a => a.name).join(', ') || 'Unknown',
+      album: match.spotifyTrack?.album?.name || match.track?.album?.name || 'Unknown',
       status: match.status,
       matchStrategy: match.matchStrategy,
       matchScore: match.matchScore,
@@ -108,10 +108,10 @@ function UnmatchedTrackItem({ match, index, onViewDetails }: UnmatchedTrackItemP
         </span>
         <div className="flex-1 min-w-0">
           <div className="font-medium text-gray-900 dark:text-gray-100 truncate">
-            {match.spotifyTrack.name}
+            {match.spotifyTrack?.name || match.track?.title}
           </div>
           <div className="text-sm text-gray-500 dark:text-gray-400 truncate">
-            {match.spotifyTrack.artists?.map(a => a.name).join(', ') || 'Unknown Artist'}
+            {match.spotifyTrack?.artists?.map(a => a.name).join(', ') || match.track?.artists?.map(a => a.name).join(', ') || 'Unknown Artist'}
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -135,7 +135,7 @@ function UnmatchedTrackItem({ match, index, onViewDetails }: UnmatchedTrackItemP
             <div>
               <span className="text-gray-500 dark:text-gray-400">Album:</span>
               <span className="ml-2 text-gray-900 dark:text-gray-100">
-                {match.spotifyTrack.album?.name || 'Unknown'}
+                {match.spotifyTrack?.album?.name || match.track?.album?.name || 'Unknown'}
               </span>
             </div>
             <div>
@@ -164,7 +164,7 @@ function UnmatchedTrackItem({ match, index, onViewDetails }: UnmatchedTrackItemP
           </div>
           {onViewDetails && (
             <button
-              onClick={() => onViewDetails(match.spotifyTrack.id || match.trackKey)}
+              onClick={() => onViewDetails(match.spotifyTrack?.id || match.track?.id || match.trackKey)}
               className="mt-3 text-sm text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300"
             >
               View Details →
@@ -295,7 +295,7 @@ export function ResultsReport({ result, onExportAgain, onBackToDashboard, onView
                   .slice(0, 20)
                   .map((match, index) => (
                     <UnmatchedTrackItem
-                      key={match.spotifyTrack.uri || match.spotifyTrack.id || match.trackKey}
+                      key={match.spotifyTrack?.uri || match.spotifyTrack?.id || match.track?.uri || match.trackKey}
                       match={match}
                       index={index}
                       onViewDetails={onViewDetails}

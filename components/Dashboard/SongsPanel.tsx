@@ -1,6 +1,7 @@
 "use client"
 
 import React, { useState, useMemo } from "react"
+import { Disc } from "lucide-react"
 
 export interface Song {
   spotifyTrackId: string
@@ -275,7 +276,7 @@ export function SongsPanel({
                           group.isLoading ? "animate-spin inline-block" : ""
                         }
                       >
-                        💿
+                        <Disc className="w-4 h-4 text-zinc-500" />
                       </span>
                       <span>{group.playlistName}</span>
                       <span className="text-zinc-500 dark:text-zinc-400 font-normal">

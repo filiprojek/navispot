@@ -1,3 +1,5 @@
+import { ProviderId } from './provider';
+
 export interface PlaylistTableItem {
   id: string;
   name: string;
@@ -14,6 +16,7 @@ export interface PlaylistTableItem {
   createdAt?: string;
   isImported?: boolean;
   trackCount?: number;
+  provider?: ProviderId;
 }
 
 export interface ExportMetadata {

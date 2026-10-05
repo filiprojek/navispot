@@ -4,10 +4,22 @@ import { useEffect, useState, useCallback, useMemo, useRef } from "react"
 import { useAuth } from "@/lib/auth/auth-context"
 import { spotifyClient } from "@/lib/spotify/client"
 import { NavidromeApiClient, parseExportMetadata } from "@/lib/navidrome/client"
-import { SpotifyPlaylist, SpotifyTrack } from "@/types/spotify"
-import { NavidromePlaylist } from "@/types/navidrome"
+import {
+  ProviderId,
+  UnifiedTrack,
+  UnifiedPlaylist,
+  SourceProvider,
+  DestinationProvider,
+} from "@/types/provider"
+import { isAppleMusicUrl } from "@/lib/apple-music/url-parser"
+import { AppleMusicClient } from "@/lib/apple-music/client"
+import { AppleMusicAdapter } from "@/lib/providers/apple-music-adapter"
+import { SpotifyAdapter } from "@/lib/providers/spotify-adapter"
+import { NavidromeAdapter } from "@/lib/providers/navidrome-adapter"
 import { PlaylistTable } from "@/components/Dashboard/PlaylistTable"
 import { ExportLayoutManager } from "@/components/Dashboard/ExportLayoutManager"
+import { SoundiizTransferHeader } from "@/components/Dashboard/SoundiizTransferHeader"
+import { AppleMusicCredentialsModal } from "@/components/apple-music-credentials-modal"
 import { error as logError } from "@/lib/support/debug-log"
 
 import { ConfirmationPopup } from "@/components/Dashboard/ConfirmationPopup"
@@ -18,7 +30,6 @@ import {
   SelectedPlaylist,
 } from "@/components/Dashboard/SelectedPlaylistsPanel"
 import {
-  UnmatchedSongsPanel,
   UnmatchedSong,
 } from "@/components/Dashboard/UnmatchedSongsPanel"
 import {
@@ -29,15 +40,14 @@ import {
 import { ProgressState } from "@/components/ProgressTracker"
 import { incrementExportCount, shouldShowSupportBubble } from "@/lib/support/export-tracker"
 import {
-  createBatchMatcher,
+  createUnifiedBatchMatcher,
   BatchMatcherOptions,
 } from "@/lib/matching/batch-matcher"
 import { getMatchStatistics } from "@/lib/matching/orchestrator"
 import {
-  createPlaylistExporter,
+  createUnifiedPlaylistExporter,
   PlaylistExporterOptions,
 } from "@/lib/export/playlist-exporter"
-import { createFavoritesExporter } from "@/lib/export/favorites-exporter"
 import {
   DashboardLayout,
   loadDashboardLayout,
@@ -71,35 +81,6 @@ import NavispotLogo from "@/public/navispot.png"
 const LIKED_SONGS_ID = "liked-songs"
 const IMPORTED_STORAGE_KEY = "navispot_imported_public_playlists"
 
-type ExportableItem =
-  | PlaylistItem
-  | SpotifyPlaylist
-  | (ImportedPlaylist & { isImported: true; items: { total: number } })
-
-interface PlaylistItem {
-  id: string
-  name: string
-  description?: string
-  images: { url: string }[]
-  owner: { id: string; display_name: string }
-  items: { total: number }
-  snapshot_id?: string
-  isLikedSongs?: boolean
-}
-
-const LIKED_SONGS_ITEM: PlaylistItem = {
-  id: LIKED_SONGS_ID,
-  name: "Liked Songs",
-  description: "Your liked tracks from Spotify",
-  images: [
-    {
-      url: 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%23E91E63"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>',
-    },
-  ],
-  owner: { id: "user", display_name: "You" },
-  items: { total: 0 },
-  isLikedSongs: true,
-}
 
 function formatDuration(ms: number): string {
   const minutes = Math.floor(ms / 60000)
@@ -111,14 +92,21 @@ export function Dashboard() {
   const {
     spotify,
     navidrome,
+    appleMusic,
+    activeSource,
+    activeDestination,
+    setActiveSource,
+    setActiveDestination,
     spotifyLogout,
     setSkipSpotify,
     playlists,
     navidromePlaylists,
+    appleMusicPlaylists,
     likedSongsCount,
-    fetchError,
+    appleMusicFavoritesCount,
     refreshing,
     refreshData,
+    refreshAppleMusicPlaylists,
   } = useAuth()
   const toast = useToast()
   const [tableItems, setTableItems] = useState<PlaylistTableItem[]>([])
@@ -127,7 +115,80 @@ export function Dashboard() {
   )
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [error, setError] = useState<string | null>(null)
-  const [progressState, setProgressState] = useState<ProgressState | null>(null)
+  const [, setProgressState] = useState<ProgressState | null>(null)
+
+  const getSourceAdapter = useCallback((source: ProviderId): SourceProvider => {
+    switch (source) {
+      case "apple-music":
+        return new AppleMusicAdapter(
+          new AppleMusicClient({
+            developerToken: appleMusic.developerToken || undefined,
+            musicUserToken: appleMusic.musicUserToken || undefined,
+            storefront: appleMusic.storefront || "us",
+          })
+        )
+      case "navidrome":
+        return new NavidromeAdapter(
+          new NavidromeApiClient(
+            navidrome.credentials?.url || "",
+            navidrome.credentials?.username || "",
+            navidrome.credentials?.password || "",
+            navidrome.token ?? undefined,
+            navidrome.clientId ?? undefined
+          )
+        )
+      case "spotify":
+      default:
+        if (spotify.token) {
+          spotifyClient.setToken(spotify.token)
+        }
+        return new SpotifyAdapter(spotifyClient)
+    }
+  }, [appleMusic, navidrome, spotify.token])
+
+  const getDestinationAdapter = useCallback((dest: ProviderId): DestinationProvider => {
+    switch (dest) {
+      case "apple-music":
+        return new AppleMusicAdapter(
+          new AppleMusicClient({
+            developerToken: appleMusic.developerToken || undefined,
+            musicUserToken: appleMusic.musicUserToken || undefined,
+            storefront: appleMusic.storefront || "us",
+          })
+        )
+      case "spotify":
+        if (spotify.token) {
+          spotifyClient.setToken(spotify.token)
+        }
+        return new SpotifyAdapter(spotifyClient)
+      case "navidrome":
+      default:
+        return new NavidromeAdapter(
+          new NavidromeApiClient(
+            navidrome.credentials?.url || "",
+            navidrome.credentials?.username || "",
+            navidrome.credentials?.password || "",
+            navidrome.token ?? undefined,
+            navidrome.clientId ?? undefined
+          )
+        )
+    }
+  }, [appleMusic, navidrome, spotify.token])
+
+  const [showAppleMusicModal, setShowAppleMusicModal] = useState(false)
+
+  // Reset selections when activeSource changes
+  const prevSourceRef = useRef(activeSource)
+  useEffect(() => {
+    if (prevSourceRef.current !== activeSource) {
+      prevSourceRef.current = activeSource
+      setSelectedIds(new Set())
+      setCheckedPlaylistIds(new Set())
+      setSelectedPlaylistsStats([])
+      setCurrentUnmatchedPlaylistId(null)
+      setUnmatchedSongs([])
+    }
+  }, [activeSource])
 
   const [isExporting, setIsExporting] = useState(false)
   const [showConfirmation, setShowConfirmation] = useState(false)
@@ -143,7 +204,7 @@ export function Dashboard() {
   const [currentUnmatchedPlaylistId, setCurrentUnmatchedPlaylistId] = useState<
     string | null
   >(null)
-  const [unmatchedSongs, setUnmatchedSongs] = useState<UnmatchedSong[]>([])
+  const [, setUnmatchedSongs] = useState<UnmatchedSong[]>([])
   const [selectedPlaylistsStats, setSelectedPlaylistsStats] = useState<
     SelectedPlaylist[]
   >([])
@@ -187,59 +248,95 @@ export function Dashboard() {
     setJSON(IMPORTED_STORAGE_KEY, importedPlaylists)
   }, [importedPlaylists])
 
-  const handlePlaylistImported = useCallback((playlist: ImportedPlaylist) => {
-    setImportedPlaylists((prev) => {
-      const filtered = prev.filter((p) => p.id !== playlist.id)
-      return [...filtered, playlist]
-    })
-  }, [])
 
   const [importingUrl, setImportingUrl] = useState(false)
 
   const handleImportFromUrl = useCallback(
     async (url: string): Promise<boolean> => {
+      const cleanUrl = url.trim()
       setImportingUrl(true)
       try {
-        const res = await fetch("/api/spotify/public-playlist", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: url.trim() }),
-        })
-        const data = await res.json()
-        if (!res.ok) {
-          toast.showError(data?.error?.message ?? `Request failed (${res.status})`)
-          return false
-        }
-        const playlist: ImportedPlaylist = data.playlist
+        if (isAppleMusicUrl(cleanUrl)) {
+          const res = await fetch("/api/apple-music/public-playlist", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url: cleanUrl }),
+          })
+          const data = await res.json()
+          if (!res.ok) {
+            toast.showError(data?.error?.message ?? `Request failed (${res.status})`)
+            return false
+          }
+          const playlist: UnifiedPlaylist = data.playlist
+          const tracks: UnifiedTrack[] = data.tracks || []
 
-        // If the playlist already lives in the user's library or in the
-        // imported list, just make sure it's selected — don't add a
-        // duplicate row. (Render-time dedup is the safety net.)
-        const ownedIds = new Set(playlists.map((p) => p.id))
-        const importedIds = new Set(importedPlaylists.map((p) => p.id))
-        if (ownedIds.has(playlist.id) || importedIds.has(playlist.id)) {
+          const importedItem: ImportedPlaylist = {
+            id: playlist.id,
+            name: playlist.name,
+            owner: playlist.owner?.displayName || "Apple Music",
+            trackCount: playlist.trackCount,
+            imageUrl: playlist.imageUrl,
+            tracks: tracks.map((t) => ({
+              id: t.id,
+              name: t.title,
+              artists: t.artists.map((a) => ({ id: a.id || "", name: a.name })),
+              album: { id: t.album?.id || "", name: t.album?.name || "" },
+              duration_ms: t.durationMs,
+              external_ids: { isrc: t.isrc },
+            })),
+            entries: [],
+            nullTrackCount: 0,
+            importedAt: new Date().toISOString(),
+          }
+
+          setImportedPlaylists((prev) => {
+            const filtered = prev.filter((p) => p.id !== importedItem.id)
+            return [...filtered, importedItem]
+          })
+          setSelectedIds((prev) => {
+            const next = new Set(prev)
+            next.add(importedItem.id)
+            return next
+          })
+          toast.showSuccess(`Imported "${playlist.name}" (${playlist.trackCount} tracks) from Apple Music`)
+          return true
+        } else {
+          const res = await fetch("/api/spotify/public-playlist", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url: cleanUrl }),
+          })
+          const data = await res.json()
+          if (!res.ok) {
+            toast.showError(data?.error?.message ?? `Request failed (${res.status})`)
+            return false
+          }
+          const playlist: ImportedPlaylist = data.playlist
+
+          const ownedIds = new Set(playlists.map((p) => p.id))
+          const importedIds = new Set(importedPlaylists.map((p) => p.id))
+          if (ownedIds.has(playlist.id) || importedIds.has(playlist.id)) {
+            setSelectedIds((prev) => {
+              const next = new Set(prev)
+              next.add(playlist.id)
+              return next
+            })
+            toast.showInfo(`"${playlist.name}" is already in your library — selected`)
+            return true
+          }
+
+          setImportedPlaylists((prev) => {
+            const filtered = prev.filter((p) => p.id !== playlist.id)
+            return [...filtered, playlist]
+          })
           setSelectedIds((prev) => {
             const next = new Set(prev)
             next.add(playlist.id)
             return next
           })
-          toast.showInfo(
-            `"${playlist.name}" is already in your library — selected`,
-          )
+          toast.showSuccess(`Imported "${playlist.name}" (${playlist.trackCount} tracks) from Spotify`)
           return true
         }
-
-        setImportedPlaylists((prev) => {
-          const filtered = prev.filter((p) => p.id !== playlist.id)
-          return [...filtered, playlist]
-        })
-        setSelectedIds((prev) => {
-          const next = new Set(prev)
-          next.add(playlist.id)
-          return next
-        })
-        toast.showSuccess(`Imported "${playlist.name}" (${playlist.trackCount} tracks)`)
-        return true
       } catch (err) {
         toast.showError(err instanceof Error ? err.message : "Network error")
         return false
@@ -282,7 +379,11 @@ export function Dashboard() {
     const oldSnapshots = new Map(playlists.map(p => [p.id, p.snapshot_id]))
 
     try {
-      await refreshData()
+      if (activeSource === "apple-music") {
+        await refreshAppleMusicPlaylists()
+      } else {
+        await refreshData()
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to refresh playlists")
     }
@@ -336,66 +437,159 @@ export function Dashboard() {
   }, [spotify.isAuthenticated])
 
   useEffect(() => {
-    const playlistItems: PlaylistTableItem[] = playlists.map((playlist) => {
-      let exportStatus: "none" | "exported" | "out-of-sync" = "none"
-      let navidromePlaylistId: string | undefined
-      let lastExportedAt: string | undefined
+    let sourceItems: PlaylistTableItem[] = []
+    const ownedIds = new Set<string>()
 
-      const cachedData = trackExportCache.get(playlist.id)
-      const hasCachedExport = cachedData && cachedData.navidromePlaylistId
+    if (activeSource === "spotify") {
+      playlists.forEach((p) => ownedIds.add(p.id))
 
-      if (navidromePlaylists.length > 0) {
-        const navPlaylist = navidromePlaylists.find((np) => {
-          const metadata = parseExportMetadata(np.comment)
-          return metadata?.spotifyPlaylistId === playlist.id
-        })
+      const playlistItems: PlaylistTableItem[] = playlists.map((playlist) => {
+        let exportStatus: "none" | "exported" | "out-of-sync" = "none"
+        let navidromePlaylistId: string | undefined
+        let lastExportedAt: string | undefined
 
-        if (navPlaylist) {
-          const metadata = parseExportMetadata(navPlaylist.comment)
-          if (metadata) {
-            navidromePlaylistId = metadata.navidromePlaylistId
-            lastExportedAt = metadata.exportedAt
+        const cachedData = trackExportCache.get(playlist.id)
+        const hasCachedExport = cachedData && cachedData.navidromePlaylistId
 
-            if (
-              playlist.snapshot_id &&
-              metadata.spotifySnapshotId === playlist.snapshot_id
-            ) {
-              exportStatus = "exported"
-            } else {
-              exportStatus = "out-of-sync"
+        if (navidromePlaylists.length > 0) {
+          const navPlaylist = navidromePlaylists.find((np) => {
+            const metadata = parseExportMetadata(np.comment)
+            return metadata?.spotifyPlaylistId === playlist.id
+          })
+
+          if (navPlaylist) {
+            const metadata = parseExportMetadata(navPlaylist.comment)
+            if (metadata) {
+              navidromePlaylistId = metadata.navidromePlaylistId
+              lastExportedAt = metadata.exportedAt
+
+              if (
+                playlist.snapshot_id &&
+                metadata.spotifySnapshotId === playlist.snapshot_id
+              ) {
+                exportStatus = "exported"
+              } else {
+                exportStatus = "out-of-sync"
+              }
             }
+          } else if (hasCachedExport) {
+            exportStatus = "exported"
+            navidromePlaylistId = cachedData.navidromePlaylistId
+            lastExportedAt = cachedData.exportedAt
           }
-        } else if (hasCachedExport) {
+        }
+
+        if (navidromePlaylists.length === 0 && hasCachedExport) {
           exportStatus = "exported"
           navidromePlaylistId = cachedData.navidromePlaylistId
           lastExportedAt = cachedData.exportedAt
         }
+
+        return {
+          id: playlist.id,
+          name: playlist.name,
+          images: playlist.images,
+          owner: { display_name: playlist.owner.display_name },
+          items: playlist.items,
+          snapshot_id: playlist.snapshot_id || "",
+          isLikedSongs: false,
+          selected: selectedIds.has(playlist.id),
+          exportStatus,
+          navidromePlaylistId,
+          lastExportedAt,
+          public: playlist.public,
+          createdAt: playlistCreatedDates.get(playlist.id),
+          provider: "spotify",
+        }
+      })
+
+      const likedSongsCachedData = trackExportCache.get(LIKED_SONGS_ID)
+      const likedSongsExportStatus = likedSongsCachedData?.navidromePlaylistId
+        ? "exported"
+        : ("none" as const)
+
+      const likedSongsItem: PlaylistTableItem = {
+        id: LIKED_SONGS_ID,
+        name: "Liked Songs",
+        images: [],
+        owner: { display_name: "You" },
+        items: { total: likedSongsCount },
+        snapshot_id: "",
+        isLikedSongs: true,
+        selected: selectedIds.has(LIKED_SONGS_ID),
+        exportStatus: likedSongsExportStatus,
+        navidromePlaylistId: likedSongsCachedData?.navidromePlaylistId,
+        lastExportedAt: likedSongsCachedData?.exportedAt,
+        public: false,
+        provider: "spotify",
       }
 
-      if (navidromePlaylists.length === 0 && hasCachedExport) {
-        exportStatus = "exported"
-        navidromePlaylistId = cachedData.navidromePlaylistId
-        lastExportedAt = cachedData.exportedAt
+      sourceItems = [likedSongsItem, ...playlistItems]
+    } else if (activeSource === "apple-music") {
+      appleMusicPlaylists.forEach((p) => ownedIds.add(p.id))
+
+      const playlistItems: PlaylistTableItem[] = appleMusicPlaylists.map((playlist) => {
+        const cachedData = trackExportCache.get(playlist.id)
+        return {
+          id: playlist.id,
+          name: playlist.name,
+          images: playlist.imageUrl ? [{ url: playlist.imageUrl }] : [],
+          owner: { display_name: playlist.owner.displayName },
+          items: { total: playlist.trackCount },
+          snapshot_id: playlist.snapshotId || "",
+          isLikedSongs: false,
+          selected: selectedIds.has(playlist.id),
+          exportStatus: cachedData?.exportedAt ? "exported" : "none",
+          navidromePlaylistId: cachedData?.navidromePlaylistId,
+          lastExportedAt: cachedData?.exportedAt,
+          public: playlist.isPublic,
+          provider: "apple-music",
+        }
+      })
+
+      const appleMusicFavoritesCachedData = trackExportCache.get(LIKED_SONGS_ID)
+      const favoritesItem: PlaylistTableItem = {
+        id: LIKED_SONGS_ID,
+        name: "Favorites",
+        images: [],
+        owner: { display_name: "You" },
+        items: { total: appleMusicFavoritesCount },
+        snapshot_id: "",
+        isLikedSongs: true,
+        selected: selectedIds.has(LIKED_SONGS_ID),
+        exportStatus: appleMusicFavoritesCachedData?.exportedAt ? "exported" : "none",
+        navidromePlaylistId: appleMusicFavoritesCachedData?.navidromePlaylistId,
+        lastExportedAt: appleMusicFavoritesCachedData?.exportedAt,
+        public: false,
+        provider: "apple-music",
       }
 
-      return {
-        id: playlist.id,
-        name: playlist.name,
-        images: playlist.images,
-        owner: { display_name: playlist.owner.display_name },
-        items: playlist.items,
-        snapshot_id: playlist.snapshot_id || "",
-        isLikedSongs: false,
-        selected: selectedIds.has(playlist.id),
-        exportStatus,
-        navidromePlaylistId,
-        lastExportedAt,
-        public: playlist.public,
-        createdAt: playlistCreatedDates.get(playlist.id),
-      }
-    })
+      sourceItems = appleMusic.isAuthenticated
+        ? [favoritesItem, ...playlistItems]
+        : playlistItems
+    } else if (activeSource === "navidrome") {
+      navidromePlaylists.forEach((p) => ownedIds.add(p.id))
 
-    const ownedIds = new Set(playlists.map((p) => p.id))
+      const playlistItems: PlaylistTableItem[] = navidromePlaylists.map((playlist) => {
+        const cachedData = trackExportCache.get(playlist.id)
+        return {
+          id: playlist.id,
+          name: playlist.name,
+          images: [],
+          owner: { display_name: navidrome.credentials?.username || "Navidrome" },
+          items: { total: playlist.songCount },
+          snapshot_id: "",
+          isLikedSongs: false,
+          selected: selectedIds.has(playlist.id),
+          exportStatus: cachedData?.exportedAt ? "exported" : "none",
+          public: playlist.public,
+          provider: "navidrome",
+        }
+      })
+
+      sourceItems = playlistItems
+    }
+
     const importedItems: PlaylistTableItem[] = importedPlaylists
       .filter((p) => !ownedIds.has(p.id))
       .map((p) => {
@@ -417,27 +611,21 @@ export function Dashboard() {
         }
       })
 
-    const likedSongsCachedData = trackExportCache.get(LIKED_SONGS_ID)
-    const likedSongsExportStatus = likedSongsCachedData?.navidromePlaylistId ? "exported" : "none" as const
-
-    const likedSongsItem: PlaylistTableItem = {
-      id: LIKED_SONGS_ID,
-      name: "Liked Songs",
-      images: [],
-      owner: { display_name: "You" },
-      items: { total: likedSongsCount },
-      snapshot_id: "",
-      isLikedSongs: true,
-      selected: selectedIds.has(LIKED_SONGS_ID),
-      exportStatus: likedSongsExportStatus,
-      navidromePlaylistId: likedSongsCachedData?.navidromePlaylistId,
-      lastExportedAt: likedSongsCachedData?.exportedAt,
-      public: false,
-    }
-
-    const allItems = [likedSongsItem, ...playlistItems, ...importedItems]
-    setTableItems(allItems)
-  }, [playlists, navidromePlaylists, selectedIds, likedSongsCount, trackExportCache, playlistCreatedDates, importedPlaylists])
+    setTableItems([...sourceItems, ...importedItems])
+  }, [
+    activeSource,
+    playlists,
+    appleMusicPlaylists,
+    navidromePlaylists,
+    importedPlaylists,
+    selectedIds,
+    likedSongsCount,
+    appleMusicFavoritesCount,
+    appleMusic.isAuthenticated,
+    navidrome.credentials?.username,
+    trackExportCache,
+    playlistCreatedDates,
+  ])
 
   // Background fetch of playlist created dates (earliest added_at)
   // Fetches progressively — updates state after each playlist for immediate UI feedback
@@ -477,7 +665,7 @@ export function Dashboard() {
         setDatesLoadedCount(cachedDates.size)
       }
 
-      const currentDates = cachedDates.size > 0 ? cachedDates : playlistCreatedDates
+      const currentDates = cachedDates
       const missingIds = playlists
         .filter((p) => !currentDates.has(p.id))
         .map((p) => p.id)
@@ -540,33 +728,16 @@ export function Dashboard() {
 
     const selectedPlaylists: SelectedPlaylist[] = []
 
-    if (selectedIds.has(LIKED_SONGS_ID)) {
-      const likedSongsCachedData = trackExportCache.get(LIKED_SONGS_ID)
-      const hasCachedExport = !!likedSongsCachedData?.navidromePlaylistId
-
-      selectedPlaylists.push({
-        id: LIKED_SONGS_ID,
-        name: "Liked Songs",
-        total: likedSongsCount,
-        matched: likedSongsCachedData?.statistics.matched ?? 0,
-        unmatched: likedSongsCachedData?.statistics.unmatched ?? 0,
-        exported: likedSongsCachedData?.statistics.matched ?? 0,
-        failed: 0,
-        status: hasCachedExport ? "exported" : "pending",
-        progress: hasCachedExport ? 100 : 0,
-      })
-    }
-
-    playlists
-      .filter((p) => selectedIds.has(p.id))
-      .forEach((p) => {
-        const cachedData = trackExportCache.get(p.id)
+    tableItems
+      .filter((item) => selectedIds.has(item.id))
+      .forEach((item) => {
+        const cachedData = trackExportCache.get(item.id)
         const hasCachedExport = !!cachedData?.navidromePlaylistId
 
         selectedPlaylists.push({
-          id: p.id,
-          name: p.name,
-          total: p.items.total,
+          id: item.id,
+          name: item.name,
+          total: item.items.total,
           matched: cachedData?.statistics.matched ?? 0,
           unmatched: cachedData?.statistics.unmatched ?? 0,
           exported: cachedData?.statistics.matched ?? 0,
@@ -575,26 +746,6 @@ export function Dashboard() {
           progress: hasCachedExport ? 100 : 0,
         })
       })
-
-    const ownedIds = new Set(playlists.map((p) => p.id))
-    for (const p of importedPlaylists) {
-      if (ownedIds.has(p.id)) continue
-      if (!selectedIds.has(p.id)) continue
-      const cachedData = trackExportCache.get(p.id)
-      const hasCachedExport = !!cachedData?.navidromePlaylistId
-
-      selectedPlaylists.push({
-        id: p.id,
-        name: p.name,
-        total: p.trackCount,
-        matched: cachedData?.statistics.matched ?? 0,
-        unmatched: cachedData?.statistics.unmatched ?? 0,
-        exported: cachedData?.statistics.matched ?? 0,
-        failed: cachedData?.statistics.unmatched ?? 0,
-        status: hasCachedExport ? "exported" : "pending",
-        progress: hasCachedExport ? 100 : 0,
-      })
-    }
 
     setSelectedPlaylistsStats(selectedPlaylists)
 
@@ -610,17 +761,15 @@ export function Dashboard() {
         return nextIds
       })
     }
-  }, [selectedIds, playlists, importedPlaylists, isExporting, trackExportCache, likedSongsCount])
+  }, [selectedIds, tableItems, isExporting, trackExportCache])
 
-  // Fetch tracks for checked playlists
-  // Fetch tracks for checked Spotify-owned playlists that aren't cached.
-  // Imported playlists already have their tracks in memory (importedPlaylists),
-  // so we skip them here and source directly in playlistGroups below.
+  // Fetch tracks for checked playlists from active source adapter
   useEffect(() => {
     let cancelled = false
 
     async function fetchTracks() {
-      if (!spotify.token) return
+      const sourceAdapter = getSourceAdapter(activeSource)
+      if (!sourceAdapter.isConnected()) return
 
       const importedIds = new Set(importedPlaylists.map((p) => p.id))
       const uncachedIds = Array.from(checkedPlaylistIds).filter(
@@ -638,29 +787,26 @@ export function Dashboard() {
       setLoadingPlaylistIds(new Set(tracksFetchInFlightRef.current))
 
       try {
-        spotifyClient.setToken(spotify.token)
         const newCache = new Map(playlistTracksCache)
 
         await Promise.all(
           uncachedIds.map(async (id) => {
             if (cancelled) return
             try {
-              let tracks
+              let unifiedTracks: UnifiedTrack[] = []
               if (id === LIKED_SONGS_ID) {
-                const savedTracks = await spotifyClient.getAllSavedTracks()
-                tracks = savedTracks.map((t) => t.track)
+                unifiedTracks = await sourceAdapter.getFavorites()
               } else {
-                const playlistTracks = await spotifyClient.getAllPlaylistTracks(id)
-                tracks = playlistTracks.map((t) => t.track)
+                unifiedTracks = await sourceAdapter.getPlaylistTracks(id)
               }
 
-              const songs: Song[] = tracks.filter((t) => t != null).map((track) => ({
-                spotifyTrackId: getTrackKey(track),
-                title: track.name,
+              const songs: Song[] = unifiedTracks.map((track) => ({
+                spotifyTrackId: track.id,
+                title: track.title,
                 album: track.album?.name || "Unknown",
                 artist:
                   track.artists?.map((a) => a.name).join(", ") || "Unknown",
-                duration: formatDuration(track.duration_ms),
+                duration: formatDuration(track.durationMs),
               }))
 
               newCache.set(id, songs)
@@ -690,7 +836,7 @@ export function Dashboard() {
     return () => {
       cancelled = true
     }
-  }, [checkedPlaylistIds, spotify.token, playlistTracksCache, importedPlaylists])
+  }, [checkedPlaylistIds, activeSource, getSourceAdapter, playlistTracksCache, importedPlaylists])
 
   useEffect(() => {
     if (selectedIds.size === 0) return
@@ -814,7 +960,7 @@ export function Dashboard() {
     })
 
     return result
-  }, [tableItems, searchQuery, sortColumn, sortDirection, ownerFilter, visibilityFilter, dateAfterFilter, dateBeforeFilter, playlistCreatedDates])
+  }, [tableItems, searchQuery, sortColumn, sortDirection, ownerFilter, visibilityFilter, dateAfterFilter, dateBeforeFilter])
 
   const handleSort = (column: "name" | "tracks" | "owner") => {
     if (sortColumn === column) {
@@ -885,31 +1031,41 @@ export function Dashboard() {
   )
 
   const handleStartExport = async () => {
-    if (!navidrome.credentials) {
-      setError("Please connect Navidrome to export playlists.")
-      return
-    }
-    const needsSpotify = selectedIds.has(LIKED_SONGS_ID) || playlists.some((p) => selectedIds.has(p.id))
-    if (needsSpotify && (!spotify.isAuthenticated || !spotify.token)) {
-      setError("Please connect Spotify to export your own playlists.")
+    if (activeSource === activeDestination) {
+      setError("Source and destination platform cannot be the same.")
       return
     }
 
-    const hasLikedSongs = selectedIds.has(LIKED_SONGS_ID)
-    const selectedPlaylists = playlists.filter((p) => selectedIds.has(p.id))
-    const selectedImported = importedPlaylists.filter((p) => selectedIds.has(p.id))
-    const itemsToExport: ExportableItem[] = []
+    const sourceAdapter = getSourceAdapter(activeSource)
+    const destAdapter = getDestinationAdapter(activeDestination)
 
-    if (hasLikedSongs) {
-      itemsToExport.push({
-        ...LIKED_SONGS_ITEM,
-        items: { total: likedSongsCount },
-      })
+    if (activeSource === "spotify" && (!spotify.isAuthenticated || !spotify.token)) {
+      setError("Please connect Spotify to export from Spotify.")
+      return
     }
-    itemsToExport.push(...selectedPlaylists)
-    for (const p of selectedImported) {
-      itemsToExport.push({ ...p, isImported: true, items: { total: p.trackCount } })
+    if (activeSource === "apple-music" && !appleMusic.isAuthenticated) {
+      setError("Please connect Apple Music to export from Apple Music.")
+      return
     }
+    if (activeSource === "navidrome" && !navidrome.credentials) {
+      setError("Please connect Navidrome to export from Navidrome.")
+      return
+    }
+
+    if (activeDestination === "navidrome" && !navidrome.credentials) {
+      setError("Please connect Navidrome as destination.")
+      return
+    }
+    if (activeDestination === "spotify" && (!spotify.isAuthenticated || !spotify.token)) {
+      setError("Please connect Spotify as destination.")
+      return
+    }
+    if (activeDestination === "apple-music" && !appleMusic.isAuthenticated) {
+      setError("Please connect Apple Music as destination.")
+      return
+    }
+
+    const itemsToExport = tableItems.filter((item) => selectedIds.has(item.id))
 
     if (itemsToExport.length === 0) {
       return
@@ -939,7 +1095,7 @@ export function Dashboard() {
         unmatched: 0,
         exported: 0,
         failed: 0,
-        total: "items" in item ? item.items.total : (item as ImportedPlaylist).trackCount,
+        total: item.items.total,
         status: "pending" as const,
         progress: 0,
       })),
@@ -948,20 +1104,8 @@ export function Dashboard() {
     setUnmatchedSongs([])
 
     try {
-      if (spotify.token) {
-        spotifyClient.setToken(spotify.token)
-      }
-      const navidromeClient = new NavidromeApiClient(
-        navidrome.credentials.url,
-        navidrome.credentials.username,
-        navidrome.credentials.password,
-        navidrome.token ?? undefined,
-        navidrome.clientId ?? undefined,
-      )
-
-      const batchMatcher = createBatchMatcher(spotifyClient, navidromeClient)
-      const playlistExporter = createPlaylistExporter(navidromeClient)
-      const favoritesExporter = createFavoritesExporter(navidromeClient)
+      const batchMatcher = createUnifiedBatchMatcher()
+      const playlistExporter = createUnifiedPlaylistExporter(destAdapter)
 
       const matcherOptions: BatchMatcherOptions = {
         enableISRC: true,
@@ -972,7 +1116,7 @@ export function Dashboard() {
 
       for (let i = 0; i < itemsToExport.length; i++) {
         const item = itemsToExport[i]
-        const itemSnapshotId = "snapshot_id" in item ? (item.snapshot_id || "") : ""
+        const itemSnapshotId = item.snapshot_id || ""
         let progress = createInitialProgressState(0)
         setProgressState(progress)
 
@@ -980,14 +1124,17 @@ export function Dashboard() {
           const newStatus = new Map(prev)
           const playlistStatus = new Map()
           let songs: Song[] = playlistTracksCache.get(item.id) || []
-          if (songs.length === 0 && "isImported" in item && item.isImported) {
-            songs = item.tracks.map((t) => ({
-              spotifyTrackId: getTrackKey(t),
-              title: t.name,
-              artist: t.artists.map((a) => a.name).join(", "),
-              album: t.album.name,
-              duration: formatDuration(t.duration_ms),
-            }))
+          if (songs.length === 0 && item.isImported) {
+            const imported = importedPlaylists.find((p) => p.id === item.id)
+            if (imported) {
+              songs = imported.tracks.map((t) => ({
+                spotifyTrackId: getTrackKey(t),
+                title: t.name,
+                artist: t.artists.map((a) => a.name).join(", "),
+                album: t.album.name,
+                duration: formatDuration(t.duration_ms),
+              }))
+            }
           }
           songs.forEach((song) => {
             playlistStatus.set(song.spotifyTrackId, "waiting")
@@ -1003,41 +1150,46 @@ export function Dashboard() {
           ),
         )
 
-        let tracks: SpotifyTrack[]
-        let isLikedSongs = false
+        let tracks: UnifiedTrack[]
+        const isFavorites = item.isLikedSongs
         let cachedData: PlaylistExportData | PlaylistExportDataV2 | undefined = undefined
         let useDifferentialMatching = false
         let upToDate = false
-        let existingNavidromeId: string | undefined = undefined
+        let existingDestId: string | undefined = undefined
 
-        if ("isLikedSongs" in item && item.isLikedSongs) {
-          const savedTracks = await spotifyClient.getAllSavedTracks(signal)
-          tracks = savedTracks.map((t) => t.track).filter((t) => t != null)
-          isLikedSongs = true
-
-          // Check for cached export data (favorites have no navidromePlaylistId,
-          // so differential matching engages purely on cache presence)
+        if (isFavorites) {
+          tracks = await sourceAdapter.getFavorites(signal)
           cachedData = loadPlaylistExportData(item.id)
-          useDifferentialMatching = !forceExportPlaylists && !!cachedData?.exportedAt
-        } else if ("isImported" in item && item.isImported) {
-          tracks = item.tracks
-          isLikedSongs = false
+          useDifferentialMatching = !forceExportPlaylists && !!cachedData?.exportedAt && activeDestination === "navidrome"
+        } else if (item.isImported) {
+          const imported = importedPlaylists.find((p) => p.id === item.id)
+          tracks = (imported?.tracks || []).map((t) => ({
+            id: t.id || getTrackKey(t),
+            title: t.name,
+            artists: t.artists.map((a) => ({ id: a.id || undefined, name: a.name })),
+            album: { id: t.album.id || undefined, name: t.album.name },
+            durationMs: t.duration_ms,
+            isrc: t.external_ids?.isrc,
+            provider: activeSource,
+          }))
           cachedData = loadPlaylistExportData(item.id)
           useDifferentialMatching = false
         } else {
-          tracks = (await spotifyClient.getAllPlaylistTracks(item.id, signal)).map(
-            (t) => t.track,
-          ).filter((t) => t != null)
-
-          // Check for cached export data
+          tracks = await sourceAdapter.getPlaylistTracks(item.id, signal)
           cachedData = loadPlaylistExportData(item.id)
-          existingNavidromeId = cachedData?.navidromePlaylistId
+          existingDestId = cachedData?.navidromePlaylistId
 
-          // If localStorage has no record, query Navidrome server for a linked playlist
-          if (!existingNavidromeId && !forceExportPlaylists) {
+          if (!existingDestId && !forceExportPlaylists && activeDestination === "navidrome" && navidrome.credentials) {
+            const navidromeClient = new NavidromeApiClient(
+              navidrome.credentials.url,
+              navidrome.credentials.username,
+              navidrome.credentials.password,
+              navidrome.token ?? undefined,
+              navidrome.clientId ?? undefined,
+            )
             const serverPlaylist = await navidromeClient.getPlaylistByComment(item.id)
             if (serverPlaylist) {
-              existingNavidromeId = serverPlaylist.id
+              existingDestId = serverPlaylist.id
               const serverMetadata = parseExportMetadata(serverPlaylist.comment)
               cachedData = {
                 spotifyPlaylistId: item.id,
@@ -1055,8 +1207,8 @@ export function Dashboard() {
           upToDate = cachedData
             ? isPlaylistUpToDate(cachedData, itemSnapshotId)
             : false
-          const hasNavidromePlaylist = !!existingNavidromeId
-          useDifferentialMatching = !forceExportPlaylists && hasNavidromePlaylist
+          const hasNavidromePlaylist = !!existingDestId
+          useDifferentialMatching = !forceExportPlaylists && hasNavidromePlaylist && activeDestination === "navidrome"
         }
 
         progress = updateProgress(progress, {
@@ -1065,21 +1217,22 @@ export function Dashboard() {
         setProgressState(progress)
 
         let matches: TrackMatch[]
-        let newTracks: SpotifyTrack[] = []
+        let newTracks: UnifiedTrack[] = []
 
         if (useDifferentialMatching && cachedData) {
           const result = await batchMatcher.matchTracksDifferential(
             tracks,
+            destAdapter,
             cachedData.tracks,
             { ...matcherOptions, signal },
             async (batchProgress) => {
               progress = updateProgress(progress, {
                 phase: "matching",
-                currentTrack: batchProgress.currentTrack
+                currentTrack: batchProgress.currentUnifiedTrack
                   ? {
-                      name: batchProgress.currentTrack.name,
+                      name: batchProgress.currentUnifiedTrack.title,
                       artist:
-                        batchProgress.currentTrack.artists
+                        batchProgress.currentUnifiedTrack.artists
                           ?.map((a) => a.name)
                           .join(", ") || "Unknown",
                       index: batchProgress.current - 1,
@@ -1110,14 +1263,13 @@ export function Dashboard() {
                 setSongExportStatus((prev) => {
                   const newStatus = new Map(prev)
                   const playlistStatus = new Map(prev.get(item.id) || [])
+                  const key = match.trackKey || match.track.id
                   if (
                     match.status === "matched" ||
                     match.status === "ambiguous"
                   ) {
-                    const key = getTrackKey(match.spotifyTrack)
                     playlistStatus.set(key, "exported")
                   } else {
-                    const key = getTrackKey(match.spotifyTrack)
                     playlistStatus.set(key, "failed")
                   }
                   newStatus.set(item.id, playlistStatus)
@@ -1132,15 +1284,16 @@ export function Dashboard() {
           matches = (
             await batchMatcher.matchTracks(
               tracks,
+              destAdapter,
               { ...matcherOptions, signal },
               async (batchProgress) => {
                 progress = updateProgress(progress, {
                   phase: "matching",
-                  currentTrack: batchProgress.currentTrack
+                  currentTrack: batchProgress.currentUnifiedTrack
                     ? {
-                        name: batchProgress.currentTrack.name,
+                        name: batchProgress.currentUnifiedTrack.title,
                         artist:
-                          batchProgress.currentTrack.artists
+                          batchProgress.currentUnifiedTrack.artists
                             ?.map((a) => a.name)
                             .join(", ") || "Unknown",
                         index: batchProgress.current - 1,
@@ -1171,13 +1324,14 @@ export function Dashboard() {
                   setSongExportStatus((prev) => {
                     const newStatus = new Map(prev)
                     const playlistStatus = new Map(prev.get(item.id) || [])
+                    const key = match.trackKey || match.track.id
                     if (
                       match.status === "matched" ||
                       match.status === "ambiguous"
                     ) {
-                      playlistStatus.set(getTrackKey(match.spotifyTrack), "exported")
+                      playlistStatus.set(key, "exported")
                     } else {
-                      playlistStatus.set(getTrackKey(match.spotifyTrack), "failed")
+                      playlistStatus.set(key, "failed")
                     }
                     newStatus.set(item.id, playlistStatus)
                     return newStatus
@@ -1204,90 +1358,16 @@ export function Dashboard() {
           ),
         )
 
-        // Build pending track status data but DO NOT save yet.
-        // Cache is only committed after exporter success.
-        if (!isLikedSongs) {
-          const tracksData: Record<string, TrackExportStatus> = {}
-          let matchedCount = 0
-          let unmatchedCount = 0
-          let ambiguousCount = 0
-
-          if (!useDifferentialMatching && cachedData) {
-            tracks.forEach((track, index) => {
-              const match = matches[index]
-              if (match) {
-                const tk = getTrackKey(track)
-                const status: TrackExportStatus = {
-                  spotifyTrackId: track.id || tk,
-                  navidromeSongId: match.navidromeSong?.id,
-                  status: match.status,
-                  matchStrategy: match.matchStrategy,
-                  matchScore: match.matchScore,
-                  matchedAt: new Date().toISOString(),
-                }
-                tracksData[tk] = status
-
-                if (match.status === "matched") {
-                  matchedCount++
-                } else if (match.status === "ambiguous") {
-                  ambiguousCount++
-                } else {
-                  unmatchedCount++
-                }
-              }
-            })
-          } else if (useDifferentialMatching && cachedData) {
-            Object.keys(cachedData.tracks).forEach((key) => {
-              tracksData[key] = cachedData.tracks[key]
-              const cachedStatus = cachedData.tracks[key]
-              if (cachedStatus.status === "matched") {
-                matchedCount++
-              } else if (cachedStatus.status === "ambiguous") {
-                ambiguousCount++
-              } else {
-                unmatchedCount++
-              }
-            })
-            newTracks.forEach((track) => {
-              const match = matches.find((m) => getTrackKey(m.spotifyTrack) === getTrackKey(track))
-              if (match) {
-                const tk = getTrackKey(track)
-                const status: TrackExportStatus = {
-                  spotifyTrackId: track.id || tk,
-                  navidromeSongId: match.navidromeSong?.id,
-                  status: match.status,
-                  matchStrategy: match.matchStrategy,
-                  matchScore: match.matchScore,
-                  matchedAt: new Date().toISOString(),
-                }
-                tracksData[tk] = status
-                if (match.status === "matched") {
-                  matchedCount++
-                } else if (match.status === "ambiguous") {
-                  ambiguousCount++
-                } else {
-                  unmatchedCount++
-                }
-              }
-            })
-          }
-
-          // Keep as pending data — commit only after exporter success
-          void tracks;
-          void matchedCount;
-          void unmatchedCount;
-          void ambiguousCount;
-        }
-
         const unmatchedSongsList: UnmatchedSong[] = matches
           .filter((m: TrackMatch) => m.status === "unmatched")
           .map((m: TrackMatch) => ({
-            title: m.spotifyTrack.name,
-            album: m.spotifyTrack.album?.name || "Unknown",
+            title: m.track?.title || m.spotifyTrack?.name || "Unknown",
+            album: m.track?.album?.name || m.spotifyTrack?.album?.name || "Unknown",
             artist:
-              m.spotifyTrack.artists?.map((a) => a.name).join(", ") ||
+              m.track?.artists?.map((a) => a.name).join(", ") ||
+              m.spotifyTrack?.artists?.map((a) => a.name).join(", ") ||
               "Unknown",
-            duration: formatDuration(m.spotifyTrack.duration_ms),
+            duration: formatDuration(m.track?.durationMs || m.spotifyTrack?.duration_ms || 0),
           }))
 
         setCurrentUnmatchedPlaylistId(item.id)
@@ -1309,13 +1389,16 @@ export function Dashboard() {
         }
 
         // Skip unchanged playlists entirely (no tracks added/removed)
-        if (upToDate && existingNavidromeId && !forceExportPlaylists && !isLikedSongs) {
-          // Tracks didn't change, but the user's visibility preference may have
-          // since been toggled — apply it directly so the on-disk state matches
-          // the current setting. The exporter would normally do this, but the
-          // early-return skips it.
+        if (upToDate && existingDestId && !forceExportPlaylists && !isFavorites && activeDestination === "navidrome" && navidrome.credentials) {
+          const navidromeClient = new NavidromeApiClient(
+            navidrome.credentials.url,
+            navidrome.credentials.username,
+            navidrome.credentials.password,
+            navidrome.token ?? undefined,
+            navidrome.clientId ?? undefined,
+          )
           const visibilityResult = await navidromeClient.updatePlaylistVisibility(
-            existingNavidromeId,
+            existingDestId,
             exportPlaylistsAsPublic,
             signal,
           )
@@ -1333,68 +1416,38 @@ export function Dashboard() {
               failed: 0,
             },
           }
-        } else if (isLikedSongs) {
-          const result = await favoritesExporter.exportFavorites(matches, {
-            skipUnmatched: false,
-            signal,
-            onProgress: async (exportProgress) => {
-              progress = updateProgress(progress, {
-                phase:
-                  exportProgress.status === "completed"
-                    ? "completed"
-                    : "exporting",
-                progress: {
-                  current: exportProgress.current,
-                  total: exportProgress.total,
-                  percent: exportProgress.percent,
-                },
-                statistics: {
-                  matched: statistics.matched,
-                  unmatched: statistics.unmatched + statistics.ambiguous,
-                  exported: exportProgress.current,
-                  failed: 0,
-                },
-              })
-              setProgressState({ ...progress })
-              setSelectedPlaylistsStats((prev) =>
-                prev.map((stat, idx) =>
-                  idx === i
-                    ? {
-                        ...stat,
-                        progress: exportProgress.percent,
-                        exported: exportProgress.current,
-                        matched: statistics.matched,
-                        unmatched: statistics.unmatched + statistics.ambiguous,
-                      }
-                    : stat,
-                ),
-              )
-            },
-          })
+        } else if (isFavorites) {
+          const matchedCandidates = matches.filter(
+            (m) => (m.status === "matched" || m.status === "ambiguous") && (m.matchedSong || m.navidromeSong),
+          )
+          const matchedIds = matchedCandidates.map(
+            (m) => (m.matchedSong?.id || m.navidromeSong?.id) as string,
+          )
+
+          if (matchedIds.length > 0 && destAdapter.saveFavorites) {
+            await destAdapter.saveFavorites(matchedIds)
+          }
 
           exportResultData = {
             statistics: {
-              total: result.statistics.total,
-              starred: result.statistics.starred,
-              skipped: result.statistics.skipped,
-              failed: result.statistics.failed,
+              total: tracks.length,
+              starred: matchedIds.length,
+              skipped: 0,
+              failed: tracks.length - matchedIds.length,
             },
           }
 
-          // Persist full export cache for liked songs (mirrors regular
-          // playlist branch but with no navidromePlaylistId since favorites
-          // are starred individually rather than collected into a playlist)
+          // Persist full export cache for favorites
           const tracksData: Record<string, TrackExportStatus> = {}
           let matchedCount = 0
           let unmatchedCount = 0
           let ambiguousCount = 0
 
           matches.forEach((match) => {
-            const track = match.spotifyTrack
-            const tk = getTrackKey(track)
+            const tk = match.trackKey || match.track.id
             const isFromCache =
               cachedData?.tracks[tk] &&
-              !newTracks.some((t) => getTrackKey(t) === tk)
+              !newTracks.some((t) => t.id === tk)
 
             if (isFromCache && cachedData) {
               tracksData[tk] = cachedData.tracks[tk]
@@ -1408,8 +1461,8 @@ export function Dashboard() {
               }
             } else {
               tracksData[tk] = {
-                spotifyTrackId: track.id || tk,
-                navidromeSongId: match.navidromeSong?.id,
+                spotifyTrackId: match.track?.id || tk,
+                navidromeSongId: match.matchedSong?.id || match.navidromeSong?.id,
                 status: match.status,
                 matchStrategy: match.matchStrategy,
                 matchScore: match.matchScore,
@@ -1523,11 +1576,10 @@ export function Dashboard() {
             let ambiguousCount = 0
 
             matches.forEach((match) => {
-              const track = match.spotifyTrack
-              const tk = getTrackKey(track)
+              const tk = match.trackKey || match.track.id
               const isFromCache =
                 cachedData?.tracks[tk] &&
-                !newTracks.some((t) => getTrackKey(t) === tk)
+                !newTracks.some((t) => t.id === tk)
 
               if (isFromCache && cachedData) {
                 tracksData[tk] = cachedData.tracks[tk]
@@ -1541,8 +1593,8 @@ export function Dashboard() {
                 }
               } else {
                 tracksData[tk] = {
-                  spotifyTrackId: track.id || tk,
-                  navidromeSongId: match.navidromeSong?.id,
+                  spotifyTrackId: match.track?.id || tk,
+                  navidromeSongId: match.matchedSong?.id || match.navidromeSong?.id,
                   status: match.status,
                   matchStrategy: match.matchStrategy,
                   matchScore: match.matchScore,
@@ -1580,16 +1632,25 @@ export function Dashboard() {
             )
 
             // Persist the link to the Navidrome playlist comment for cross-browser identity
-            try {
-              await navidromeClient.updatePlaylistComment(result.playlistId, {
-                spotifyPlaylistId: item.id,
-                navidromePlaylistId: result.playlistId,
-                spotifySnapshotId: itemSnapshotId,
-                exportedAt: updatedCache.exportedAt,
-                trackCount: tracks.length,
-              }, signal)
-            } catch (e) {
-              console.warn('Failed to update playlist comment:', e)
+            if (activeDestination === "navidrome" && navidrome.credentials) {
+              try {
+                const navidromeClient = new NavidromeApiClient(
+                  navidrome.credentials.url,
+                  navidrome.credentials.username,
+                  navidrome.credentials.password,
+                  navidrome.token ?? undefined,
+                  navidrome.clientId ?? undefined,
+                )
+                await navidromeClient.updatePlaylistComment(result.playlistId, {
+                  spotifyPlaylistId: item.id,
+                  navidromePlaylistId: result.playlistId,
+                  spotifySnapshotId: itemSnapshotId,
+                  exportedAt: updatedCache.exportedAt,
+                  trackCount: tracks.length,
+                }, signal)
+              } catch (e) {
+                console.warn('Failed to update playlist comment:', e)
+              }
             }
           }
         }
@@ -1701,26 +1762,13 @@ export function Dashboard() {
   }
 
   const confirmationPlaylists: PlaylistInfo[] = useMemo(() => {
-    const result: PlaylistInfo[] = []
-
-    if (selectedIds.has(LIKED_SONGS_ID)) {
-      result.push({ name: "Liked Songs", trackCount: likedSongsCount })
-    }
-
-    playlists
+    return tableItems
       .filter((p) => selectedIds.has(p.id))
-      .forEach((p) => {
-        result.push({ name: p.name, trackCount: p.items.total })
-      })
-
-    importedPlaylists
-      .filter((p) => selectedIds.has(p.id))
-      .forEach((p) => {
-        result.push({ name: p.name, trackCount: p.trackCount })
-      })
-
-    return result
-  }, [selectedIds, likedSongsCount, playlists, importedPlaylists])
+      .map((p) => ({
+        name: p.name,
+        trackCount: p.items.total,
+      }))
+  }, [tableItems, selectedIds])
 
   const playlistGroups: PlaylistGroup[] = useMemo(() => {
     const importedById = new Map(importedPlaylists.map((p) => [p.id, p]))
@@ -1955,7 +2003,27 @@ export function Dashboard() {
         exportPlaylistsAsPublic={exportPlaylistsAsPublic}
         onExportPlaylistsAsPublicChange={handleExportPlaylistsAsPublicChange}
       />
-      
+
+      <AppleMusicCredentialsModal
+        isOpen={showAppleMusicModal}
+        onClose={() => setShowAppleMusicModal(false)}
+      />
+
+      <SoundiizTransferHeader
+        activeSource={activeSource}
+        activeDestination={activeDestination}
+        onSelectSource={setActiveSource}
+        onSelectDestination={setActiveDestination}
+        spotifyCount={playlists.length + (likedSongsCount > 0 ? 1 : 0)}
+        appleMusicCount={appleMusicPlaylists.length + (appleMusicFavoritesCount > 0 ? 1 : 0)}
+        navidromeCount={navidromePlaylists.length}
+        isSpotifyConnected={spotify.isAuthenticated}
+        isAppleMusicConnected={appleMusic.isAuthenticated}
+        isNavidromeConnected={navidrome.isConnected}
+        isExporting={isExporting}
+        onManageAppleMusic={() => setShowAppleMusicModal(true)}
+      />
+
       <ExportLayoutManager
         layout={layout}
         selectedPlaylistsSection={selectedPlaylistsSection}

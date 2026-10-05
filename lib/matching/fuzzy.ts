@@ -244,32 +244,53 @@ export function hasVersionMismatch(spotifyTitle: string, navidromeTitle: string)
   return true;
 }
 
-export function calculateTrackSimilarity(
-  spotifyTrack: import('@/types/spotify').SpotifyTrack,
-  navidromeSong: import('@/types/navidrome').NavidromeSong
-): number {
-  const hasSpotifyArtist = spotifyTrack.artists && spotifyTrack.artists.length > 0;
-  const hasSpotifyAlbum = spotifyTrack.album && spotifyTrack.album.name && spotifyTrack.album.name.length > 0;
+export interface UnifiedFuzzyMatchResult {
+  candidate: import('@/types/provider').DestinationMatchCandidate;
+  score: number;
+}
 
-  const artistSimilarity = hasSpotifyArtist
-    ? calculateBestArtistSimilarity(
-        spotifyTrack.artists.map((a) => a.name),
-        navidromeSong.artist
-      )
+export interface UnifiedFuzzyCandidateResult {
+  matches: import('@/types/provider').DestinationMatchCandidate[];
+  hasAmbiguous: boolean;
+  bestMatch?: import('@/types/provider').DestinationMatchCandidate;
+  score: number;
+  candidates: import('@/types/provider').DestinationMatchCandidate[];
+}
+
+export function calculateUnifiedSimilarity(
+  track: import('@/types/provider').UnifiedTrack | import('@/types/spotify').SpotifyTrack,
+  candidate: import('@/types/provider').DestinationMatchCandidate | import('@/types/navidrome').NavidromeSong
+): number {
+  const isUnified = 'title' in track;
+  const trackTitle = isUnified ? track.title : track.name;
+  const trackArtists = isUnified
+    ? (track.artists || []).map((a) => a.name)
+    : (track.artists || []).map((a) => a.name);
+  const trackAlbum = isUnified ? track.album?.name || '' : track.album?.name || '';
+  const trackDurationMs = isUnified ? track.durationMs : track.duration_ms;
+
+  const candidateTitle = candidate.title;
+  const candidateArtist = candidate.artist;
+  const candidateAlbum = candidate.album || '';
+  const candidateDurationSec =
+    'durationMs' in candidate ? candidate.durationMs / 1000 : candidate.duration;
+
+  const hasArtist = trackArtists.length > 0;
+  const hasAlbum = trackAlbum.length > 0;
+
+  const artistSimilarity = hasArtist
+    ? calculateBestArtistSimilarity(trackArtists, candidateArtist)
     : -1;
 
-  const titleSimilarity = calculateTitleSimilarity(
-    spotifyTrack.name,
-    navidromeSong.title
-  );
+  const titleSimilarity = calculateTitleSimilarity(trackTitle, candidateTitle);
 
   const durationSimilarity = calculateDurationSimilarity(
-    spotifyTrack.duration_ms,
-    navidromeSong.duration
+    trackDurationMs,
+    candidateDurationSec
   );
 
-  const albumSimilarity = hasSpotifyAlbum
-    ? calculateAlbumSimilarity(spotifyTrack.album.name, navidromeSong.album)
+  const albumSimilarity = hasAlbum
+    ? calculateAlbumSimilarity(trackAlbum, candidateAlbum)
     : -1;
 
   let availableWeight = 0;
@@ -319,11 +340,64 @@ export function calculateTrackSimilarity(
   }
 
   // Version mismatch penalty: reject different versions (remix vs original, live vs original, etc.)
-  if (hasVersionMismatch(spotifyTrack.name, navidromeSong.title)) {
+  if (hasVersionMismatch(trackTitle, candidateTitle)) {
     baseSimilarity = Math.min(baseSimilarity, 0.5);
   }
 
   return baseSimilarity;
+}
+
+export function calculateTrackSimilarity(
+  spotifyTrack: import('@/types/spotify').SpotifyTrack,
+  navidromeSong: import('@/types/navidrome').NavidromeSong
+): number {
+  return calculateUnifiedSimilarity(spotifyTrack, navidromeSong);
+}
+
+export function findBestUnifiedMatch(
+  track: import('@/types/provider').UnifiedTrack,
+  candidates: import('@/types/provider').DestinationMatchCandidate[],
+  threshold: number = 0.8
+): UnifiedFuzzyCandidateResult {
+  if (candidates.length === 0) {
+    return { matches: [], hasAmbiguous: false, score: 0, candidates: [] };
+  }
+
+  const scoredMatches = candidates
+    .map((candidate) => ({
+      candidate,
+      score: calculateUnifiedSimilarity(track, candidate),
+    }))
+    .filter((match) => match.score >= threshold)
+    .sort((a, b) => b.score - a.score);
+
+  if (scoredMatches.length === 0) {
+    return { matches: [], hasAmbiguous: false, score: 0, candidates: [] };
+  }
+
+  const bestScore = scoredMatches[0].score;
+  const thresholdMatches = scoredMatches.filter(
+    (m) => m.score >= bestScore - 0.05
+  );
+
+  const firstMatch = thresholdMatches[0];
+  const allSameSong =
+    thresholdMatches.length > 1 &&
+    thresholdMatches.every(
+      (m) =>
+        m.candidate.title === firstMatch.candidate.title &&
+        m.candidate.artist === firstMatch.candidate.artist
+    );
+
+  const hasAmbiguous = thresholdMatches.length > 1 && !allSameSong;
+
+  return {
+    matches: scoredMatches.map((m) => m.candidate),
+    hasAmbiguous,
+    bestMatch: scoredMatches[0].candidate,
+    score: scoredMatches[0].score,
+    candidates: scoredMatches.map((m) => m.candidate),
+  };
 }
 
 export function findBestMatch(

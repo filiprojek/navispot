@@ -55,6 +55,18 @@ export function parseExportMetadata(comment: string | undefined): ExportMetadata
   }
 }
 
+interface SubsonicSongEntry {
+  id: string;
+  title: string;
+  artist?: string;
+  artistId?: string;
+  album?: string;
+  albumId?: string;
+  duration?: number;
+  year?: number;
+  isrc?: string;
+}
+
 export class NavidromeApiClient {
   private baseUrl: string;
   private authHeader: string;
@@ -72,6 +84,10 @@ export class NavidromeApiClient {
     this._ndToken = ndToken ?? '';
     this._ndClientId = ndClientId ?? '';
     this._totalCount = 0;
+  }
+
+  isConnected(): boolean {
+    return Boolean(this.baseUrl && (this._ndToken || this.authHeader));
   }
 
   async login(username: string, password: string, signal?: AbortSignal): Promise<{
@@ -308,6 +324,53 @@ export class NavidromeApiClient {
       playlist,
       tracks,
     };
+  }
+
+  async getSubsonicPlaylist(
+    playlistId: string,
+    signal?: AbortSignal
+  ): Promise<{
+    playlist: NavidromePlaylist;
+    tracks: NavidromeNativeSong[];
+  }> {
+    try {
+      const url = this._buildSubsonicUrl('/rest/getPlaylist', { id: playlistId });
+      const response = await fetch(url, { signal });
+      if (!response.ok) {
+        return this.getPlaylist(playlistId, signal);
+      }
+      const data = await response.json();
+      const subResponse = data['subsonic-response'];
+      if (subResponse?.status === 'failed' || !subResponse?.playlist) {
+        return this.getPlaylist(playlistId, signal);
+      }
+      const pl = subResponse.playlist;
+      const playlist: NavidromePlaylist = {
+        id: pl.id,
+        name: pl.name,
+        comment: pl.comment,
+        songCount: pl.songCount ?? (Array.isArray(pl.entry) ? pl.entry.length : 0),
+        duration: pl.duration ?? 0,
+        createdAt: pl.created || new Date().toISOString(),
+        updatedAt: pl.changed || pl.created || new Date().toISOString(),
+        public: pl.public,
+      };
+      const entries = Array.isArray(pl.entry) ? (pl.entry as SubsonicSongEntry[]) : [];
+      const tracks: NavidromeNativeSong[] = entries.map((entry) => ({
+        id: entry.id,
+        title: entry.title,
+        artist: entry.artist || '',
+        artistId: entry.artistId || '',
+        album: entry.album || '',
+        albumId: entry.albumId || '',
+        duration: entry.duration ?? 0,
+        year: entry.year,
+        isrc: entry.isrc ? [entry.isrc] : undefined,
+      }));
+      return { playlist, tracks };
+    } catch {
+      return this.getPlaylist(playlistId, signal);
+    }
   }
 
   async createPlaylist(name: string, songIds: string[], isPublic: boolean = false, signal?: AbortSignal): Promise<{
@@ -831,6 +894,39 @@ export class NavidromeApiClient {
     }
 
     return allStarredSongs;
+  }
+
+  async getStarred2(signal?: AbortSignal): Promise<NavidromeNativeSong[]> {
+    try {
+      const url = this._buildSubsonicUrl('/rest/getStarred2');
+      const response = await fetch(url, { signal });
+      if (!response.ok) {
+        return this.getStarredSongs(signal);
+      }
+      const data = await response.json();
+      const subResponse = data['subsonic-response'];
+      if (subResponse?.status === 'failed') {
+        return this.getStarredSongs(signal);
+      }
+      const songs = subResponse?.starred2?.song || subResponse?.starred?.song || [];
+      if (!Array.isArray(songs) || songs.length === 0) {
+        const nativeStarred = await this.getStarredSongs(signal);
+        if (nativeStarred.length > 0) return nativeStarred;
+      }
+      return (songs as SubsonicSongEntry[]).map((entry) => ({
+        id: entry.id,
+        title: entry.title,
+        artist: entry.artist || '',
+        artistId: entry.artistId || '',
+        album: entry.album || '',
+        albumId: entry.albumId || '',
+        duration: entry.duration ?? 0,
+        year: entry.year,
+        isrc: entry.isrc ? [entry.isrc] : undefined,
+      }));
+    } catch {
+      return this.getStarredSongs(signal);
+    }
   }
 
   async getPlaylistByComment(spotifyPlaylistId: string): Promise<NavidromePlaylist | null> {

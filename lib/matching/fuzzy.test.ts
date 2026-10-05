@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { calculateTrackSimilarity, findBestMatch, normalizeTitle, normalizeArtistName, calculateBestArtistSimilarity, calculateAlbumSimilarity, normalizeString, hasVersionMismatch, extractVersionMarkers } from '@/lib/matching/fuzzy';
+import { calculateTrackSimilarity, findBestMatch, normalizeTitle, normalizeArtistName, calculateBestArtistSimilarity, calculateAlbumSimilarity, normalizeString, hasVersionMismatch } from '@/lib/matching/fuzzy';
 import { SpotifyTrack } from '@/types/spotify';
 import { NavidromeSong } from '@/types/navidrome';
 

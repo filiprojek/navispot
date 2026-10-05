@@ -4,6 +4,7 @@ import { useEffect } from "react"
 import { useAuth } from "@/lib/auth/auth-context"
 import { Dashboard } from "@/components/Dashboard"
 import { SpotifyConnectButton } from "@/components/spotify-connect-button"
+import { AppleMusicConnectButton } from "@/components/apple-music-connect-button"
 import { SkipSpotifyButton } from "@/components/skip-spotify-button"
 import { NavidromeCredentialsForm } from "@/components/navidrome-credentials-form"
 import { ErrorBoundary } from "@/components/ErrorBoundary"
@@ -36,13 +37,17 @@ function GlobalErrorHandler() {
 }
 
 export default function Home() {
-  const { isLoading, spotify, navidrome, skipSpotify } = useAuth()
+  const { isLoading, spotify, navidrome, appleMusic, skipSpotify } = useAuth()
 
   if (isLoading) {
     return <LoadingScreen />
   }
 
-  const isAuthenticated = skipSpotify || (navidrome.isConnected && spotify.isAuthenticated)
+  const hasDestination = navidrome.isConnected || appleMusic.isAuthenticated || spotify.isAuthenticated
+  const isAuthenticated =
+    (skipSpotify && hasDestination) ||
+    (spotify.isAuthenticated && (navidrome.isConnected || appleMusic.isAuthenticated)) ||
+    (appleMusic.isAuthenticated && (navidrome.isConnected || spotify.isAuthenticated))
 
   if (isAuthenticated) {
     return (
@@ -89,11 +94,12 @@ export default function Home() {
             NaviSpot
           </h1>
           <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">
-            Export your Spotify playlists to Navidrome
+            Migrate and sync playlists between Spotify, Apple Music, and Navidrome
           </p>
         </div>
 
         <div className="space-y-6 rounded-lg border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-900">
+          {/* Spotify Section */}
           <div className="flex flex-col gap-4 border-b border-zinc-200 pb-6 dark:border-zinc-800">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
@@ -108,6 +114,20 @@ export default function Home() {
             <SkipSpotifyButton />
           </div>
 
+          {/* Apple Music Section */}
+          <div className="flex flex-col gap-4 border-b border-zinc-200 pb-6 dark:border-zinc-800">
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
+                Apple Music
+              </h2>
+              <AppleMusicConnectButton />
+            </div>
+            <p className="text-sm text-zinc-500 dark:text-zinc-400">
+              Connect your Apple Music subscription using web session tokens or Apple developer credentials.
+            </p>
+          </div>
+
+          {/* Navidrome Section */}
           <div>
             <NavidromeCredentialsForm />
           </div>

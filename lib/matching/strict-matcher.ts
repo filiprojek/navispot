@@ -1,10 +1,13 @@
 import { SpotifyTrack } from '@/types/spotify';
-import { TrackMatch } from '@/types/matching';
+import { TrackMatch, MatchStatus } from '@/types/matching';
 import { NavidromeApiClient } from '@/lib/navidrome/client';
 import { NavidromeNativeSong } from '@/types/navidrome';
+import { UnifiedTrack, DestinationMatchCandidate } from '@/types/provider';
 import { convertNativeSongToNavidromeSong } from './orchestrator';
 import { trackKey as getTrackKey } from '@/lib/spotify/track-identity';
 import { normalizeTitle as normalizeTitleFuzzy, normalizeArtistName as normalizeArtistNameFuzzy, hasVersionMismatch } from './fuzzy';
+import { toUnifiedTrack } from '@/lib/providers/spotify-adapter';
+import { toDestinationMatchCandidate } from '@/lib/providers/navidrome-adapter';
 
 export function normalizeString(str: string): string {
   return str
@@ -15,12 +18,12 @@ export function normalizeString(str: string): string {
     .replace(/^(the|a|an)\s+/, '');
 }
 
-export function filterStrictMatches(
-  songs: NavidromeNativeSong[],
+export function filterStrictMatches<T extends { title: string; artist: string }>(
+  songs: T[],
   normalizedArtist: string | null,
   normalizedTitle: string,
   rawSpotifyTitle?: string
-): NavidromeNativeSong[] {
+): T[] {
   return songs.filter((song) => {
     const songTitle = normalizeTitleFuzzy(song.title);
     if (songTitle !== normalizedTitle) return false;
@@ -33,6 +36,58 @@ export function filterStrictMatches(
   });
 }
 
+export function matchUnifiedCandidateStrict(
+  track: UnifiedTrack,
+  candidates: DestinationMatchCandidate[]
+): {
+  status: MatchStatus;
+  matchedCandidate?: DestinationMatchCandidate;
+  candidates?: DestinationMatchCandidate[];
+} {
+  const normTitle = normalizeTitleFuzzy(track.title);
+  if (!normTitle) {
+    return { status: 'unmatched' };
+  }
+
+  const artists = (track.artists || []).map((a) => a.name).filter((n) => n.trim().length > 0);
+  const normalizedArtist = artists.length > 0
+    ? normalizeArtistNameFuzzy(artists.join(' '))
+    : null;
+
+  const matches = filterStrictMatches(candidates, normalizedArtist, normTitle, track.title);
+
+  if (matches.length === 0) {
+    return { status: 'unmatched' };
+  }
+
+  if (matches.length === 1) {
+    return { status: 'matched', matchedCandidate: matches[0] };
+  }
+
+  if (matches.length > 1 && normalizedArtist === null) {
+    if (track.durationMs) {
+      const durationMatches = matches.filter(
+        (s) => Math.abs(s.durationMs - track.durationMs) < 2000
+      );
+      if (durationMatches.length === 1) {
+        return { status: 'matched', matchedCandidate: durationMatches[0] };
+      }
+    }
+    return { status: 'ambiguous', candidates: matches };
+  }
+
+  const firstMatch = matches[0];
+  const allSame = matches.every(
+    (m) => m.title === firstMatch.title && m.artist === firstMatch.artist
+  );
+
+  if (!allSame) {
+    return { status: 'ambiguous', candidates: matches };
+  }
+
+  return { status: 'matched', matchedCandidate: firstMatch };
+}
+
 export async function matchByStrict(
   client: NavidromeApiClient,
   spotifyTrack: SpotifyTrack,
@@ -40,6 +95,7 @@ export async function matchByStrict(
   signal?: AbortSignal
 ): Promise<TrackMatch> {
   const tk = getTrackKey(spotifyTrack);
+  const unifiedTrack = toUnifiedTrack(spotifyTrack);
   const hasArtist = spotifyTrack.artists && spotifyTrack.artists.length > 0 && spotifyTrack.artists.some(a => a.name.trim().length > 0);
   const normalizedArtist = hasArtist
     ? normalizeArtistNameFuzzy(spotifyTrack.artists.map((a) => a.name).join(' '))
@@ -48,6 +104,7 @@ export async function matchByStrict(
 
   if (!normalizedTitle) {
     return {
+      track: unifiedTrack,
       spotifyTrack,
       matchStrategy: 'strict',
       matchScore: 0,
@@ -62,6 +119,7 @@ export async function matchByStrict(
 
     if (matches.length === 0) {
       return {
+        track: unifiedTrack,
         spotifyTrack,
         matchStrategy: 'strict',
         matchScore: 0,
@@ -76,9 +134,12 @@ export async function matchByStrict(
         (s) => Math.abs(s.duration - spotifyDurationSec) < 2
       );
       if (durationMatches.length === 1) {
+        const ndSong = convertNativeSongToNavidromeSong(durationMatches[0]);
         return {
+          track: unifiedTrack,
           spotifyTrack,
-          navidromeSong: convertNativeSongToNavidromeSong(durationMatches[0]),
+          navidromeSong: ndSong,
+          matchedSong: toDestinationMatchCandidate(ndSong),
           matchStrategy: 'strict',
           matchScore: 1,
           status: 'matched',
@@ -86,11 +147,12 @@ export async function matchByStrict(
         };
       }
       return {
+        track: unifiedTrack,
         spotifyTrack,
         matchStrategy: 'strict',
         matchScore: 0,
         status: 'ambiguous',
-        candidates: matches.map(convertNativeSongToNavidromeSong),
+        candidates: matches.map(convertNativeSongToNavidromeSong).map(toDestinationMatchCandidate),
         trackKey: tk,
       };
     }
@@ -102,18 +164,22 @@ export async function matchByStrict(
 
     if (!allSame) {
       return {
+        track: unifiedTrack,
         spotifyTrack,
         matchStrategy: 'strict',
         matchScore: 0,
         status: 'ambiguous',
-        candidates: matches.map(convertNativeSongToNavidromeSong),
+        candidates: matches.map(convertNativeSongToNavidromeSong).map(toDestinationMatchCandidate),
         trackKey: tk,
       };
     }
 
+    const ndSong = convertNativeSongToNavidromeSong(firstMatch);
     return {
+      track: unifiedTrack,
       spotifyTrack,
-      navidromeSong: convertNativeSongToNavidromeSong(firstMatch),
+      navidromeSong: ndSong,
+      matchedSong: toDestinationMatchCandidate(ndSong),
       matchStrategy: 'strict',
       matchScore: 1,
       status: 'matched',
@@ -124,6 +190,7 @@ export async function matchByStrict(
       throw error;
     }
     return {
+      track: unifiedTrack,
       spotifyTrack,
       matchStrategy: 'strict',
       matchScore: 0,
@@ -132,3 +199,4 @@ export async function matchByStrict(
     };
   }
 }
+

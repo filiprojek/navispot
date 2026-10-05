@@ -1,14 +1,14 @@
-import { NavidromeApiClient, parseExportMetadata } from '@/lib/navidrome/client';
+import { NavidromeApiClient } from '@/lib/navidrome/client';
 import { TrackMatch } from '@/types/matching';
+import { DestinationProvider } from '@/types/provider';
 import {
   PlaylistExportData,
   PlaylistExportDataV2,
   TrackExportStatus,
-  savePlaylistExportData,
 } from './track-export-cache';
-import { trackKey as getTrackKey } from '@/lib/spotify/track-identity';
 
 export type ExportMode = 'create' | 'append' | 'overwrite' | 'update';
+
 
 interface PlaylistExportDataLocal {
   spotifyPlaylistId: string;
@@ -109,8 +109,8 @@ export class DefaultPlaylistExporter implements PlaylistExporter {
       }
     };
 
-    const matchedTracks = matches.filter((m) => m.status === 'matched' && m.navidromeSong);
-    const unmatchedCount = matches.filter((m) => m.status !== 'matched' || !m.navidromeSong).length;
+    const matchedTracks = matches.filter((m) => m.status === 'matched' && (m.navidromeSong || m.matchedSong));
+    const unmatchedCount = matches.filter((m) => m.status !== 'matched' || (!m.navidromeSong && !m.matchedSong)).length;
 
     skipped = skipUnmatched ? unmatchedCount : 0;
 
@@ -144,7 +144,7 @@ export class DefaultPlaylistExporter implements PlaylistExporter {
       checkAbort();
       const songIds: string[] = [];
       for (const m of matchedTracks) {
-        const id = m.navidromeSong!.id;
+        const id = m.navidromeSong?.id || m.matchedSong?.id;
         if (id) songIds.push(id);
       }
 
@@ -356,6 +356,248 @@ export function createPlaylistExporter(navidromeClient: NavidromeApiClient): Pla
   return new DefaultPlaylistExporter(navidromeClient);
 }
 
+export interface UnifiedPlaylistExporter {
+  createPlaylist(
+    name: string,
+    trackIds: string[],
+    options?: { isPublic?: boolean; description?: string }
+  ): Promise<{ id: string; success: boolean }>;
+  appendToPlaylist(
+    playlistId: string,
+    trackIds: string[]
+  ): Promise<{ success: boolean }>;
+  exportPlaylist(
+    playlistName: string,
+    matches: TrackMatch[],
+    options?: PlaylistExporterOptions
+  ): Promise<ExportResult>;
+}
+
+export class DefaultUnifiedPlaylistExporter implements UnifiedPlaylistExporter {
+  private destination: DestinationProvider;
+
+  constructor(destination: DestinationProvider) {
+    this.destination = destination;
+  }
+
+  async createPlaylist(
+    name: string,
+    trackIds: string[],
+    options?: { isPublic?: boolean; description?: string }
+  ): Promise<{ id: string; success: boolean }> {
+    return this.destination.createPlaylist(name, trackIds, options);
+  }
+
+  async appendToPlaylist(
+    playlistId: string,
+    trackIds: string[]
+  ): Promise<{ success: boolean }> {
+    return this.destination.appendToPlaylist(playlistId, trackIds);
+  }
+
+  async exportPlaylist(
+    playlistName: string,
+    matches: TrackMatch[],
+    options: PlaylistExporterOptions = {}
+  ): Promise<ExportResult> {
+    const startTime = Date.now();
+    const mode = options.mode ?? 'create';
+    const skipUnmatched = options.skipUnmatched ?? false;
+    const isPublic = options.isPublic ?? false;
+    const onProgress = options.onProgress;
+    const { signal } = options;
+
+    const errors: ExportError[] = [];
+    let exported = 0;
+    let skipped = 0;
+    let playlistId: string | undefined;
+
+    const checkAbort = () => {
+      if (signal?.aborted) {
+        throw new DOMException('Export was cancelled', 'AbortError');
+      }
+    };
+
+    const matchedTracks = matches.filter(
+      (m) => m.status === 'matched' && (m.matchedSong || m.navidromeSong)
+    );
+    const unmatchedCount = matches.filter(
+      (m) => m.status !== 'matched' || (!m.matchedSong && !m.navidromeSong)
+    ).length;
+
+    skipped = skipUnmatched ? unmatchedCount : 0;
+
+    if (onProgress) {
+      checkAbort();
+      await onProgress({
+        current: 0,
+        total: matchedTracks.length,
+        percent: 0,
+        status: 'preparing',
+      });
+    }
+
+    if (matchedTracks.length === 0) {
+      return {
+        success: true,
+        playlistName,
+        mode,
+        statistics: {
+          total: matches.length,
+          exported: 0,
+          failed: 0,
+          skipped: matches.length,
+        },
+        errors: [],
+        duration: Date.now() - startTime,
+      };
+    }
+
+    try {
+      checkAbort();
+      const trackIds: string[] = [];
+      for (const m of matchedTracks) {
+        const id = m.matchedSong?.id || m.navidromeSong?.id;
+        if (id) trackIds.push(id);
+      }
+
+      if (trackIds.length === 0) {
+        return {
+          success: true,
+          playlistName,
+          mode,
+          statistics: {
+            total: matches.length,
+            exported: 0,
+            failed: 0,
+            skipped: matches.length,
+          },
+          errors: [],
+          duration: Date.now() - startTime,
+        };
+      }
+
+      switch (mode) {
+        case 'create': {
+          checkAbort();
+          const createResult = await this.destination.createPlaylist(
+            playlistName,
+            trackIds,
+            { isPublic }
+          );
+          if (!createResult.success || !createResult.id) {
+            errors.push({
+              trackName: 'N/A',
+              artistName: 'N/A',
+              reason: `Failed to create playlist`,
+            });
+            break;
+          }
+          playlistId = createResult.id;
+          exported = trackIds.length;
+          break;
+        }
+        case 'append': {
+          if (!options.existingPlaylistId) {
+            throw new Error('existingPlaylistId is required for append mode');
+          }
+          checkAbort();
+          const result = await this.destination.appendToPlaylist(
+            options.existingPlaylistId,
+            trackIds
+          );
+          if (!result.success) {
+            errors.push({
+              trackName: 'N/A',
+              artistName: 'N/A',
+              reason: `Failed to append tracks to playlist`,
+            });
+            break;
+          }
+          exported = trackIds.length;
+          playlistId = options.existingPlaylistId;
+          break;
+        }
+        case 'overwrite':
+        case 'update': {
+          if (!options.existingPlaylistId) {
+            throw new Error(`existingPlaylistId is required for ${mode} mode`);
+          }
+          checkAbort();
+          const destWithOverwrite = this.destination as DestinationProvider & {
+            overwritePlaylist?: (id: string, ids: string[]) => Promise<{ success: boolean }>;
+          };
+          if (typeof destWithOverwrite.overwritePlaylist === 'function') {
+            const res = await destWithOverwrite.overwritePlaylist(options.existingPlaylistId, trackIds);
+            if (!res.success) {
+              errors.push({
+                trackName: 'N/A',
+                artistName: 'N/A',
+                reason: `Failed to ${mode} playlist`,
+              });
+              break;
+            }
+          } else {
+            const res = await this.destination.appendToPlaylist(options.existingPlaylistId, trackIds);
+            if (!res.success) {
+              errors.push({
+                trackName: 'N/A',
+                artistName: 'N/A',
+                reason: `Failed to ${mode} playlist`,
+              });
+              break;
+            }
+          }
+          exported = trackIds.length;
+          playlistId = options.existingPlaylistId;
+          break;
+        }
+      }
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw error;
+      }
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      errors.push({
+        trackName: 'N/A',
+        artistName: 'N/A',
+        reason: `Failed to ${mode} playlist: ${errorMessage}`,
+      });
+    }
+
+    if (onProgress) {
+      checkAbort();
+      await onProgress({
+        current: matchedTracks.length,
+        total: matchedTracks.length,
+        percent: 100,
+        status: exported > 0 || skipped > 0 ? 'completed' : 'failed',
+      });
+    }
+
+    const success = errors.length === 0 && exported > 0;
+
+    return {
+      success,
+      playlistId,
+      playlistName,
+      mode,
+      statistics: {
+        total: matches.length,
+        exported,
+        failed: errors.length > 0 ? matches.length - exported : 0,
+        skipped,
+      },
+      errors,
+      duration: Date.now() - startTime,
+    };
+  }
+}
+
+export function createUnifiedPlaylistExporter(destination: DestinationProvider): UnifiedPlaylistExporter {
+  return new DefaultUnifiedPlaylistExporter(destination);
+}
+
 export default createPlaylistExporter;
 
 function arraysEqual(a: string[], b: string[]): boolean {
@@ -365,3 +607,4 @@ function arraysEqual(a: string[], b: string[]): boolean {
   }
   return true;
 }
+

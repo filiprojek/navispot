@@ -48,6 +48,11 @@ export class SpotifyClient {
     return this.token;
   }
 
+  isAuthenticated(): boolean {
+    const token = this.token || (typeof window !== 'undefined' ? this.loadTokenFromStorage() : null);
+    return Boolean(token && token.accessToken);
+  }
+
   async getCurrentUser(signal?: AbortSignal): Promise<SpotifyUser> {
     await spotifyRateLimiter.acquire();
     const response = await this.fetch('/me', signal);
@@ -255,6 +260,98 @@ export class SpotifyClient {
     }
 
     return result;
+  }
+
+  async search(
+    query: string,
+    type: string = 'track',
+    limit: number = 20,
+    signal?: AbortSignal,
+  ): Promise<{ tracks?: { items: SpotifyTrack[]; total: number } }> {
+    await spotifyRateLimiter.acquire();
+    const params = new URLSearchParams({
+      q: query,
+      type,
+      limit: limit.toString(),
+    });
+    const response = await this.fetch(`/search?${params.toString()}`, signal);
+    return response.json();
+  }
+
+  async createPlaylist(
+    name: string,
+    options?: { isPublic?: boolean; description?: string },
+    signal?: AbortSignal,
+  ): Promise<SpotifyPlaylist> {
+    await spotifyRateLimiter.acquire();
+    const body = {
+      name,
+      public: options?.isPublic ?? false,
+      description: options?.description ?? '',
+    };
+    try {
+      const response = await this.fetch('/me/playlists', signal, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+      return response.json();
+    } catch {
+      // Fallback to /users/{user_id}/playlists
+      const user = await this.getCurrentUser(signal);
+      const response = await this.fetch(`/users/${encodeURIComponent(user.id)}/playlists`, signal, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      });
+      return response.json();
+    }
+  }
+
+  async addTracksToPlaylist(
+    playlistId: string,
+    uris: string[],
+    signal?: AbortSignal,
+  ): Promise<{ snapshot_id?: string }> {
+    if (uris.length === 0) return {};
+    const normalizedUris = uris.map((u) => (u.startsWith('spotify:') ? u : `spotify:track:${u}`));
+    const BATCH_SIZE = 100;
+    let lastSnapshotId: string | undefined;
+
+    for (let i = 0; i < normalizedUris.length; i += BATCH_SIZE) {
+      if (signal?.aborted) {
+        throw new DOMException('Operation aborted', 'AbortError');
+      }
+      await spotifyRateLimiter.acquire();
+      const batch = normalizedUris.slice(i, i + BATCH_SIZE);
+      const response = await this.fetch(`/playlists/${playlistId}/items`, signal, {
+        method: 'POST',
+        body: JSON.stringify({ uris: batch }),
+      });
+      const data = await response.json();
+      lastSnapshotId = data.snapshot_id;
+    }
+
+    return { snapshot_id: lastSnapshotId };
+  }
+
+  async saveTracks(
+    trackIds: string[],
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (trackIds.length === 0) return;
+    const normalizedIds = trackIds.map((id) => id.replace(/^spotify:track:/, ''));
+    const BATCH_SIZE = 50;
+
+    for (let i = 0; i < normalizedIds.length; i += BATCH_SIZE) {
+      if (signal?.aborted) {
+        throw new DOMException('Operation aborted', 'AbortError');
+      }
+      await spotifyRateLimiter.acquire();
+      const batch = normalizedIds.slice(i, i + BATCH_SIZE);
+      await this.fetch('/me/tracks', signal, {
+        method: 'PUT',
+        body: JSON.stringify({ ids: batch }),
+      });
+    }
   }
 
   async refreshAccessToken(): Promise<SpotifyToken | null> {

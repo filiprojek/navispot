@@ -1,12 +1,27 @@
 'use client';
 
 import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
-import { AuthContextType, SpotifyAuthState, NavidromeAuthState, SPOTIFY_STORAGE_KEY, NAVIDROME_STORAGE_KEY, SKIP_SPOTIFY_STORAGE_KEY } from '@/types/auth-context';
+import {
+  AuthContextType,
+  SpotifyAuthState,
+  NavidromeAuthState,
+  AppleMusicAuthState,
+  SPOTIFY_STORAGE_KEY,
+  NAVIDROME_STORAGE_KEY,
+  APPLE_MUSIC_STORAGE_KEY,
+  SKIP_SPOTIFY_STORAGE_KEY,
+  ACTIVE_SOURCE_STORAGE_KEY,
+  ACTIVE_DESTINATION_STORAGE_KEY,
+} from '@/types/auth-context';
 import { SpotifyToken, SpotifyUser } from '@/types/spotify-auth';
 import { SpotifyPlaylist } from '@/types/spotify';
 import { NavidromePlaylist, NavidromeCredentials } from '@/types/navidrome';
+import { ProviderId, UnifiedPlaylist } from '@/types/provider';
 import { NavidromeApiClient } from '@/lib/navidrome/client';
 import { spotifyClient } from '@/lib/spotify/client';
+import { AppleMusicClient } from '@/lib/apple-music/client';
+import { AppleMusicAdapter } from '@/lib/providers/apple-music-adapter';
+import { setStoredTokens, clearStoredTokens } from '@/lib/apple-music/token-manager';
 import { getJSON, setJSON } from '@/lib/storage';
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -25,6 +40,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     token: null,
     clientId: null,
   });
+  const [appleMusic, setAppleMusic] = useState<AppleMusicAuthState>({
+    isAuthenticated: false,
+    mode: null,
+    developerToken: null,
+    musicUserToken: null,
+    storefront: 'us',
+    error: null,
+  });
+  const [appleMusicPlaylists, setAppleMusicPlaylists] = useState<UnifiedPlaylist[]>([]);
+  const [appleMusicFavoritesCount, setAppleMusicFavoritesCount] = useState<number>(0);
+
+  const [activeSource, setActiveSourceState] = useState<ProviderId>(() =>
+    getJSON<ProviderId>(ACTIVE_SOURCE_STORAGE_KEY, 'spotify'),
+  );
+  const [activeDestination, setActiveDestinationState] = useState<ProviderId>(() =>
+    getJSON<ProviderId>(ACTIVE_DESTINATION_STORAGE_KEY, 'navidrome'),
+  );
+
   const [isLoading, setIsLoading] = useState(true);
   const [skipSpotify, setSkipSpotifyState] = useState<boolean>(() =>
     getJSON<boolean>(SKIP_SPOTIFY_STORAGE_KEY, false),
@@ -197,14 +230,37 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const refreshData = useCallback(async () => {
-    if (!spotify.isAuthenticated || !spotify.token) return;
     setRefreshing(true);
     try {
-      await fetchInitialData(spotify, navidrome);
+      if (spotify.isAuthenticated && spotify.token) {
+        await fetchInitialData(spotify, navidrome);
+      }
+      if (appleMusic.isAuthenticated && appleMusic.developerToken && appleMusic.musicUserToken) {
+        try {
+          const client = new AppleMusicClient({
+            developerToken: appleMusic.developerToken,
+            musicUserToken: appleMusic.musicUserToken,
+            storefront: appleMusic.storefront || 'us',
+          });
+          const adapter = new AppleMusicAdapter(client);
+          const [pLists, favs] = await Promise.allSettled([
+            adapter.listPlaylists(),
+            adapter.getFavorites(),
+          ]);
+          if (pLists.status === 'fulfilled') {
+            setAppleMusicPlaylists(pLists.value);
+          }
+          if (favs.status === 'fulfilled') {
+            setAppleMusicFavoritesCount(favs.value.length);
+          }
+        } catch (err) {
+          console.warn('Failed to refresh Apple Music in refreshData:', err);
+        }
+      }
     } finally {
       setRefreshing(false);
     }
-  }, [spotify, navidrome, fetchInitialData]);
+  }, [spotify, navidrome, appleMusic, fetchInitialData]);
 
   const loadStoredAuth = useCallback(async () => {
     let resolvedSpotify: SpotifyAuthState = {
@@ -275,6 +331,38 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           clientId: parsed.clientId ?? '',
         };
         await testNavidromeConnection(navCreds);
+      }
+
+      const storedAppleMusic = localStorage.getItem(APPLE_MUSIC_STORAGE_KEY);
+      if (storedAppleMusic) {
+        try {
+          const parsed = JSON.parse(storedAppleMusic);
+          if (parsed.developerToken && parsed.musicUserToken) {
+            const amState: AppleMusicAuthState = {
+              isAuthenticated: true,
+              mode: parsed.mode || 'web-token',
+              developerToken: parsed.developerToken,
+              musicUserToken: parsed.musicUserToken,
+              storefront: parsed.storefront || 'us',
+              error: null,
+            };
+            setAppleMusic(amState);
+            const client = new AppleMusicClient({
+              developerToken: parsed.developerToken,
+              musicUserToken: parsed.musicUserToken,
+              storefront: parsed.storefront || 'us',
+            });
+            const adapter = new AppleMusicAdapter(client);
+            adapter.listPlaylists().then(setAppleMusicPlaylists).catch((err) => {
+              console.warn('Failed to load initial Apple Music playlists:', err);
+            });
+            adapter.getFavorites().then((favs) => {
+              setAppleMusicFavoritesCount(favs.length);
+            }).catch(() => {});
+          }
+        } catch (amErr) {
+          console.error('Error parsing stored Apple Music auth:', amErr);
+        }
       }
 
       if (!storedSpotify) {
@@ -487,9 +575,171 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  const setActiveSource = useCallback((source: ProviderId) => {
+    setActiveSourceState(source);
+    setJSON(ACTIVE_SOURCE_STORAGE_KEY, source);
+    setActiveDestinationState((prevDest) => {
+      if (prevDest === source) {
+        const candidates: ProviderId[] = ['navidrome', 'apple-music', 'spotify'];
+        const nextDest = candidates.find((c) => c !== source) || 'navidrome';
+        setJSON(ACTIVE_DESTINATION_STORAGE_KEY, nextDest);
+        return nextDest;
+      }
+      return prevDest;
+    });
+  }, []);
+
+  const setActiveDestination = useCallback(
+    (dest: ProviderId) => {
+      if (dest === activeSource) return;
+      setActiveDestinationState(dest);
+      setJSON(ACTIVE_DESTINATION_STORAGE_KEY, dest);
+    },
+    [activeSource]
+  );
+
+  const connectAppleMusicWithTokens = useCallback(
+    async (tokens: {
+      developerToken?: string;
+      musicUserToken?: string;
+      storefront?: string;
+    }): Promise<boolean> => {
+      let devToken = tokens.developerToken?.trim() || '';
+      const userToken = tokens.musicUserToken?.trim() || '';
+      const storefront = tokens.storefront?.trim() || 'us';
+
+      if (!devToken) {
+        try {
+          const res = await fetch('/api/apple-music/developer-token');
+          if (res.ok) {
+            const data = await res.json();
+            if (data.developerToken) {
+              devToken = data.developerToken;
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (!devToken) {
+        setAppleMusic((prev) => ({
+          ...prev,
+          isAuthenticated: false,
+          error: 'Apple Music Developer Token is required',
+        }));
+        return false;
+      }
+
+      if (!userToken) {
+        setAppleMusic((prev) => ({
+          ...prev,
+          isAuthenticated: false,
+          error: 'Media-User-Token is required',
+        }));
+        return false;
+      }
+
+      try {
+        const client = new AppleMusicClient({
+          developerToken: devToken,
+          musicUserToken: userToken,
+          storefront,
+        });
+
+        const adapter = new AppleMusicAdapter(client);
+        const pLists = await adapter.listPlaylists();
+
+        const nextState: AppleMusicAuthState = {
+          isAuthenticated: true,
+          mode: 'web-token',
+          developerToken: devToken,
+          musicUserToken: userToken,
+          storefront,
+          error: null,
+        };
+
+        localStorage.setItem(APPLE_MUSIC_STORAGE_KEY, JSON.stringify(nextState));
+        setStoredTokens({ developerToken: devToken, musicUserToken: userToken, storefront });
+
+        setAppleMusic(nextState);
+        setAppleMusicPlaylists(pLists);
+
+        try {
+          const favs = await adapter.getFavorites();
+          setAppleMusicFavoritesCount(favs.length);
+        } catch {
+          setAppleMusicFavoritesCount(0);
+        }
+
+        return true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : 'Failed to connect to Apple Music';
+        setAppleMusic((prev) => ({
+          ...prev,
+          isAuthenticated: false,
+          error: msg,
+        }));
+        return false;
+      }
+    },
+    []
+  );
+
+  const disconnectAppleMusic = useCallback(() => {
+    localStorage.removeItem(APPLE_MUSIC_STORAGE_KEY);
+    clearStoredTokens();
+    setAppleMusic({
+      isAuthenticated: false,
+      mode: null,
+      developerToken: null,
+      musicUserToken: null,
+      storefront: 'us',
+      error: null,
+    });
+    setAppleMusicPlaylists([]);
+    setAppleMusicFavoritesCount(0);
+  }, []);
+
+  const refreshAppleMusicPlaylists = useCallback(async () => {
+    if (!appleMusic.isAuthenticated || !appleMusic.developerToken || !appleMusic.musicUserToken) {
+      return;
+    }
+    try {
+      const client = new AppleMusicClient({
+        developerToken: appleMusic.developerToken,
+        musicUserToken: appleMusic.musicUserToken,
+        storefront: appleMusic.storefront || 'us',
+      });
+      const adapter = new AppleMusicAdapter(client);
+      const [pLists, favs] = await Promise.allSettled([
+        adapter.listPlaylists(),
+        adapter.getFavorites(),
+      ]);
+      if (pLists.status === 'fulfilled') {
+        setAppleMusicPlaylists(pLists.value);
+      }
+      if (favs.status === 'fulfilled') {
+        setAppleMusicFavoritesCount(favs.value.length);
+      }
+    } catch (err) {
+      console.warn('Failed to refresh Apple Music playlists:', err);
+    }
+  }, [appleMusic]);
+
   const value: AuthContextType = {
     spotify,
     navidrome,
+    appleMusic,
+    activeSource,
+    activeDestination,
+    setActiveSource,
+    setActiveDestination,
+    connectAppleMusicWithTokens,
+    disconnectAppleMusic,
+    appleMusicPlaylists,
+    appleMusicFavoritesCount,
+    refreshAppleMusicPlaylists,
     spotifyLogin,
     spotifyLogout,
     refreshSpotifyToken,

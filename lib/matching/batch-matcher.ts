@@ -1,20 +1,33 @@
 import { SpotifyClient } from '@/lib/spotify/client';
 import { NavidromeApiClient } from '@/lib/navidrome/client';
-import { SpotifyPlaylistTrack, SpotifyTrack, SpotifyPlaylistEntry } from '@/types/spotify';
+import { SpotifyPlaylistTrack, SpotifyTrack } from '@/types/spotify';
 import { TrackMatch, MatchStrategy } from '@/types/matching';
-import { matchTracks, getMatchStatistics, MatchingOrchestratorOptions as OrchestratorOptions, defaultMatchingOptions } from './orchestrator';
+import { UnifiedTrack, DestinationProvider, DestinationMatchCandidate } from '@/types/provider';
+import {
+  matchTracks,
+  matchUnifiedTracks,
+  getMatchStatistics,
+  buildTrackMatch,
+  getUnifiedTrackKey,
+  MatchingOrchestratorOptions as OrchestratorOptions,
+  defaultMatchingOptions,
+} from './orchestrator';
 import { TrackExportStatus } from '@/lib/export/track-export-cache';
 import { trackKey as getTrackKey } from '@/lib/spotify/track-identity';
+import { toUnifiedTrack } from '@/lib/providers/spotify-adapter';
+import { toDestinationMatchCandidate } from '@/lib/providers/navidrome-adapter';
 
 export interface BatchMatcherProgress {
   current: number;
   total: number;
   currentTrack?: SpotifyTrack;
+  currentUnifiedTrack?: UnifiedTrack;
   currentMatch?: TrackMatch;
   percent: number;
   matched?: number;
   unmatched?: number;
 }
+
 
 export type ProgressCallback = (progress: BatchMatcherProgress) => void | Promise<void>;
 
@@ -269,6 +282,7 @@ export class DefaultBatchMatcher implements BatchMatcher {
 
     const cachedMatches: TrackMatch[] = tracksFromCache.map(({ track, cachedStatus }) => {
       const tk = getTrackKey(track);
+      const unifiedTrack = toUnifiedTrack(track);
       if (cachedStatus.status === 'matched' || cachedStatus.status === 'ambiguous') {
         const navidromeSong = cachedStatus.navidromeSongId ? {
           id: cachedStatus.navidromeSongId,
@@ -280,8 +294,10 @@ export class DefaultBatchMatcher implements BatchMatcher {
         } : undefined;
 
         return {
+          track: unifiedTrack,
           spotifyTrack: track,
           navidromeSong,
+          matchedSong: navidromeSong ? toDestinationMatchCandidate(navidromeSong) : undefined,
           matchScore: cachedStatus.matchScore,
           matchStrategy: cachedStatus.matchStrategy as MatchStrategy,
           status: cachedStatus.status,
@@ -290,8 +306,10 @@ export class DefaultBatchMatcher implements BatchMatcher {
         };
       } else {
         return {
+          track: unifiedTrack,
           spotifyTrack: track,
           navidromeSong: undefined,
+          matchedSong: undefined,
           matchScore: 0,
           matchStrategy: 'none' as MatchStrategy,
           status: cachedStatus.status,
@@ -354,3 +372,288 @@ export function createBatchMatcher(
 ): BatchMatcher {
   return new DefaultBatchMatcher(spotifyClient, navidromeClient);
 }
+
+export interface UnifiedBatchMatcher {
+  matchTracks(
+    tracks: UnifiedTrack[],
+    destination: DestinationProvider,
+    options?: BatchMatcherOptions,
+    onProgress?: ProgressCallback
+  ): Promise<{ matches: TrackMatch[]; statistics: BatchMatchResult['statistics'] }>;
+
+  matchTracksDifferential(
+    tracks: UnifiedTrack[],
+    destination: DestinationProvider,
+    cachedTracks: Record<string, TrackExportStatus>,
+    options?: BatchMatcherOptions,
+    onProgress?: ProgressCallback
+  ): Promise<{
+    matches: TrackMatch[];
+    statistics: BatchMatchResult['statistics'];
+    newTracks: UnifiedTrack[];
+    cachedMatches: TrackMatch[];
+  }>;
+}
+
+export class DefaultUnifiedBatchMatcher implements UnifiedBatchMatcher {
+  async matchTracks(
+    tracks: UnifiedTrack[],
+    destination: DestinationProvider,
+    options: BatchMatcherOptions = {},
+    onProgress?: ProgressCallback
+  ): Promise<{ matches: TrackMatch[]; statistics: BatchMatchResult['statistics'] }> {
+    const { signal, ...matcherOptions } = options;
+
+    const orchestratorOptions: Partial<OrchestratorOptions> = {
+      enableISRC: matcherOptions.enableISRC ?? defaultMatchingOptions.enableISRC,
+      enableFuzzy: matcherOptions.enableFuzzy ?? defaultMatchingOptions.enableFuzzy,
+      enableStrict: matcherOptions.enableStrict ?? defaultMatchingOptions.enableStrict,
+      fuzzyThreshold: matcherOptions.fuzzyThreshold ?? defaultMatchingOptions.fuzzyThreshold,
+      maxSearchResults: matcherOptions.maxSearchResults ?? defaultMatchingOptions.maxSearchResults,
+    };
+
+    const matches: TrackMatch[] = [];
+    const total = tracks.length;
+    const concurrency = matcherOptions.concurrency ?? 1;
+
+    const checkAbort = () => {
+      if (signal?.aborted) {
+        throw new DOMException('Export was cancelled', 'AbortError');
+      }
+    };
+
+    if (concurrency <= 1) {
+      for (let i = 0; i < tracks.length; i++) {
+        checkAbort();
+        const track = tracks[i];
+        const match = await matchUnifiedTracks(destination, [track], orchestratorOptions, signal);
+        matches.push(match[0]);
+
+        let matched = 0;
+        let unmatched = 0;
+        for (const m of matches) {
+          if (m.status === 'matched' || m.status === 'ambiguous') {
+            matched++;
+          } else {
+            unmatched++;
+          }
+        }
+
+        if (onProgress) {
+          await onProgress({
+            current: i + 1,
+            total,
+            currentTrack: match[0].spotifyTrack,
+            currentUnifiedTrack: track,
+            currentMatch: match[0],
+            percent: Math.round(((i + 1) / total) * 100),
+            matched,
+            unmatched,
+          });
+        }
+      }
+    } else {
+      const chunks: UnifiedTrack[][] = [];
+      for (let i = 0; i < tracks.length; i += concurrency) {
+        chunks.push(tracks.slice(i, i + concurrency));
+      }
+
+      let processed = 0;
+      for (const chunk of chunks) {
+        checkAbort();
+        const chunkResults = await Promise.all(
+          chunk.map(async (track) => {
+            const result = await matchUnifiedTracks(destination, [track], orchestratorOptions, signal);
+            return result[0];
+          })
+        );
+        matches.push(...chunkResults);
+        processed += chunk.length;
+
+        let matched = 0;
+        let unmatched = 0;
+        for (const m of matches) {
+          if (m.status === 'matched' || m.status === 'ambiguous') {
+            matched++;
+          } else {
+            unmatched++;
+          }
+        }
+
+        if (onProgress) {
+          await onProgress({
+            current: processed,
+            total,
+            currentTrack: chunkResults[chunkResults.length - 1].spotifyTrack,
+            currentUnifiedTrack: chunk[chunk.length - 1],
+            currentMatch: chunkResults[chunkResults.length - 1],
+            percent: Math.round((processed / total) * 100),
+            matched,
+            unmatched,
+          });
+        }
+      }
+    }
+
+    const statistics = getMatchStatistics(matches) as BatchMatchResult['statistics'];
+    return { matches, statistics };
+  }
+
+  async matchTracksDifferential(
+    tracks: UnifiedTrack[],
+    destination: DestinationProvider,
+    cachedTracks: Record<string, TrackExportStatus>,
+    options: BatchMatcherOptions = {},
+    onProgress?: ProgressCallback
+  ): Promise<{
+    matches: TrackMatch[];
+    statistics: BatchMatchResult['statistics'];
+    newTracks: UnifiedTrack[];
+    cachedMatches: TrackMatch[];
+  }> {
+    const { signal, ...matcherOptions } = options;
+
+    const orchestratorOptions: Partial<OrchestratorOptions> = {
+      enableISRC: matcherOptions.enableISRC ?? defaultMatchingOptions.enableISRC,
+      enableFuzzy: matcherOptions.enableFuzzy ?? defaultMatchingOptions.enableFuzzy,
+      enableStrict: matcherOptions.enableStrict ?? defaultMatchingOptions.enableStrict,
+      fuzzyThreshold: matcherOptions.fuzzyThreshold ?? defaultMatchingOptions.fuzzyThreshold,
+      maxSearchResults: matcherOptions.maxSearchResults ?? defaultMatchingOptions.maxSearchResults,
+    };
+
+    const tracksToMatch: UnifiedTrack[] = [];
+    const tracksFromCache: Array<{ track: UnifiedTrack; cachedStatus: TrackExportStatus }> = [];
+
+    tracks.forEach((track) => {
+      const tk = getUnifiedTrackKey(track);
+      const cachedStatus = cachedTracks[tk];
+      if (cachedStatus) {
+        tracksFromCache.push({ track, cachedStatus });
+      } else {
+        tracksToMatch.push(track);
+      }
+    });
+
+    const concurrency = matcherOptions.concurrency ?? 1;
+    const newMatches: TrackMatch[] = [];
+
+    const checkAbort = () => {
+      if (signal?.aborted) {
+        throw new DOMException('Export was cancelled', 'AbortError');
+      }
+    };
+
+    if (tracksToMatch.length > 0) {
+      if (concurrency <= 1) {
+        for (let i = 0; i < tracksToMatch.length; i++) {
+          checkAbort();
+          const track = tracksToMatch[i];
+          const match = await matchUnifiedTracks(destination, [track], orchestratorOptions, signal);
+          newMatches.push(match[0]);
+        }
+      } else {
+        const chunks: UnifiedTrack[][] = [];
+        for (let i = 0; i < tracksToMatch.length; i += concurrency) {
+          chunks.push(tracksToMatch.slice(i, i + concurrency));
+        }
+
+        for (const chunk of chunks) {
+          checkAbort();
+          const chunkResults = await Promise.all(
+            chunk.map(async (track) => {
+              const result = await matchUnifiedTracks(destination, [track], orchestratorOptions, signal);
+              return result[0];
+            })
+          );
+          newMatches.push(...chunkResults);
+        }
+      }
+    }
+
+    const cachedMatches: TrackMatch[] = tracksFromCache.map(({ track, cachedStatus }) => {
+      const tk = getUnifiedTrackKey(track);
+      if (cachedStatus.status === 'matched' || cachedStatus.status === 'ambiguous') {
+        const destinationCandidate: DestinationMatchCandidate | undefined = cachedStatus.navidromeSongId
+          ? {
+              id: cachedStatus.navidromeSongId,
+              title: track.title,
+              artist: track.artists?.[0]?.name || 'Unknown',
+              album: track.album?.name || 'Unknown',
+              durationMs: track.durationMs,
+              isrc: track.isrc,
+            }
+          : undefined;
+
+        return buildTrackMatch({
+          track,
+          matchedSong: destinationCandidate,
+          matchScore: cachedStatus.matchScore,
+          matchStrategy: cachedStatus.matchStrategy as MatchStrategy,
+          status: cachedStatus.status,
+          candidates: undefined,
+          trackKey: tk,
+        });
+      } else {
+        return buildTrackMatch({
+          track,
+          matchedSong: undefined,
+          matchScore: 0,
+          matchStrategy: 'none' as MatchStrategy,
+          status: cachedStatus.status,
+          candidates: undefined,
+          trackKey: tk,
+        });
+      }
+    });
+
+    const allMatches: TrackMatch[] = [];
+    const trackMap = new Map<string, TrackMatch>();
+
+    tracks.forEach((track) => {
+      const tk = getUnifiedTrackKey(track);
+      const cachedStatus = cachedTracks[tk];
+      if (cachedStatus) {
+        const cachedMatch = cachedMatches.find((m) => m.trackKey === tk);
+        if (cachedMatch) {
+          trackMap.set(tk, cachedMatch);
+        }
+      }
+    });
+
+    newMatches.forEach((match) => {
+      trackMap.set(match.trackKey, match);
+    });
+
+    tracks.forEach((track) => {
+      const tk = getUnifiedTrackKey(track);
+      const match = trackMap.get(tk);
+      if (match) {
+        allMatches.push(match);
+      }
+    });
+
+    const statistics = getMatchStatistics(allMatches) as BatchMatchResult['statistics'];
+
+    if (onProgress) {
+      await onProgress({
+        current: tracks.length,
+        total: tracks.length,
+        percent: 100,
+        matched: statistics.matched,
+        unmatched: statistics.unmatched + statistics.ambiguous,
+      });
+    }
+
+    return {
+      matches: allMatches,
+      statistics,
+      newTracks: tracksToMatch,
+      cachedMatches,
+    };
+  }
+}
+
+export function createUnifiedBatchMatcher(): UnifiedBatchMatcher {
+  return new DefaultUnifiedBatchMatcher();
+}
+

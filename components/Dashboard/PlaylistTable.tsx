@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useRef, useEffect, useMemo, memo, useCallback } from "react"
+import { useState, useRef, useEffect, useMemo, useCallback } from "react"
 import { createPortal } from "react-dom"
 import Image from "next/image"
 import { Calendar } from "@/components/ui/calendar"
@@ -10,6 +10,7 @@ import {
   getExportStatusBadgeColor,
   getExportStatusLabel,
 } from "@/types/playlist-table"
+import { isAppleMusicUrl } from "@/lib/apple-music/url-parser"
 
 // DatePicker component using shadcn Calendar with portal
 function DatePicker({
@@ -43,7 +44,6 @@ function DatePicker({
       
       // Check available space
       const spaceAbove = rect.top
-      const spaceBelow = window.innerHeight - rect.bottom
       
       // Position: top center if space, otherwise bottom center
       let top
@@ -76,7 +76,7 @@ function DatePicker({
     }
   }, [isOpen])
 
-  const date = value ? new Date(value) : undefined
+  const date = useMemo(() => (value ? new Date(value) : undefined), [value])
 
   const handleSelect = useCallback((selectedDate: Date | undefined) => {
     if (selectedDate) {
@@ -120,7 +120,7 @@ function DatePicker({
       </div>,
       document.body
     )
-  }, [isOpen, calendarPosition.ready, calendarPosition.top, calendarPosition.left, date])
+  }, [isOpen, calendarPosition.ready, calendarPosition.top, calendarPosition.left, date, handleSelect])
 
   return (
     <div ref={pickerRef} className={`relative ${className}`}>
@@ -189,7 +189,44 @@ interface PlaylistTableProps {
   datesLoadedCount?: number
 }
 
-const LIKED_SONGS_ID = "liked-songs"
+function calculatePopoverPosition(buttonRect: DOMRect): {
+  top: number
+  left: number
+  isReady: boolean
+  placement: "above" | "below"
+} {
+  const spaceBelow = window.innerHeight - buttonRect.bottom
+  const spaceAbove = buttonRect.top
+  const popoverHeight = Math.min(400, window.innerHeight * 0.7)
+  const popoverWidth = window.innerWidth < 640 ? 320 : 384
+
+  let placement: "above" | "below" = "below"
+  if (spaceBelow < popoverHeight && spaceAbove > spaceBelow) {
+    placement = "above"
+  }
+
+  let top = placement === "below"
+    ? buttonRect.bottom + 8
+    : buttonRect.top - popoverHeight - 8
+
+  if (top < 8) {
+    top = 8
+    if (placement === "above") {
+      top = buttonRect.bottom + 8
+      placement = "below"
+    }
+  }
+
+  const buttonCenter = buttonRect.left + (buttonRect.width / 2)
+  let left = buttonCenter - (popoverWidth / 2)
+
+  if (left < 8) left = 8
+  if (left + popoverWidth > window.innerWidth - 8) {
+    left = window.innerWidth - popoverWidth - 8
+  }
+
+  return { top, left, isReady: true, placement }
+}
 
 const SortIcon = ({ direction }: { direction: "asc" | "desc" | null }) => {
   if (!direction) {
@@ -265,7 +302,6 @@ function formatDate(dateStr: string): string {
 export function PlaylistTable({
   items,
   totalCount,
-  likedSongsCount,
   selectedIds,
   onToggleSelection,
   onToggleSelectAll,
@@ -298,106 +334,56 @@ export function PlaylistTable({
 }: PlaylistTableProps) {
   const [showFilters, setShowFilters] = useState(false)
   const [showClearConfirm, setShowClearConfirm] = useState(false)
-  const [popoverPosition, setPopoverPosition] = useState<"below" | "above">("below")
+  const [popoverStyle, setPopoverStyle] = useState<{
+    top: number
+    left: number
+    isReady: boolean
+    placement: "above" | "below"
+  }>({ top: 0, left: 0, isReady: false, placement: "below" })
   const filterButtonRef = useRef<HTMLButtonElement>(null)
   const filterPanelRef = useRef<HTMLDivElement>(null)
 
-  const isSpotifyUrl = useMemo(() => {
+  const detectedUrlType = useMemo<"spotify" | "apple-music" | null>(() => {
     const q = searchQuery.trim()
-    if (!q) return false
-    return /open\.spotify\.com\/playlist\/[A-Za-z0-9]{22}|^[A-Za-z0-9]{22}$/.test(q)
+    if (!q) return null
+    if (/open\.spotify\.com\/playlist\/[A-Za-z0-9]{22}|^[A-Za-z0-9]{22}$/.test(q)) {
+      return "spotify"
+    }
+    if (isAppleMusicUrl(q)) {
+      return "apple-music"
+    }
+    return null
   }, [searchQuery])
 
+  const isImportableUrl = detectedUrlType !== null
+
   const handleImportClick = useCallback(async () => {
-    if (!isSpotifyUrl || isImporting) return
+    if (!isImportableUrl || isImporting) return
     const ok = await onImportClick(searchQuery.trim())
     if (ok) {
       onSearchChange("")
     }
-  }, [isSpotifyUrl, isImporting, onImportClick, searchQuery, onSearchChange])
+  }, [isImportableUrl, isImporting, onImportClick, searchQuery, onSearchChange])
 
-  // Calculate popover position based on viewport space
-  const [popoverStyle, setPopoverStyle] = useState<{ top: number; left: number; isReady: boolean }>({ top: 0, left: 0, isReady: false })
-  
   useEffect(() => {
-    if (showFilters && filterButtonRef.current) {
-      const buttonRect = filterButtonRef.current.getBoundingClientRect()
-      const spaceBelow = window.innerHeight - buttonRect.bottom
-      const spaceAbove = buttonRect.top
-      const popoverHeight = Math.min(400, window.innerHeight * 0.7)
-      const popoverWidth = window.innerWidth < 640 ? 320 : 384 // w-80 or w-96
+    if (!showFilters) return
 
-      // Determine position (above or below)
-      let position: "above" | "below" = "below"
-      if (spaceBelow < popoverHeight && spaceAbove > spaceBelow) {
-        position = "above"
-        setPopoverPosition("above")
-      } else {
-        setPopoverPosition("below")
+    const updatePosition = () => {
+      if (filterButtonRef.current) {
+        setPopoverStyle(
+          calculatePopoverPosition(filterButtonRef.current.getBoundingClientRect())
+        )
       }
+    }
 
-      // Calculate vertical position
-      let top = position === "below"
-        ? buttonRect.bottom + 8
-        : buttonRect.top - popoverHeight - 8
+    const rafId = requestAnimationFrame(updatePosition)
+    window.addEventListener("resize", updatePosition)
 
-      // Ensure it doesn't go above viewport
-      if (top < 8) {
-        top = 8
-        // If we can't fit above, force below
-        if (position === "above") {
-          top = buttonRect.bottom + 8
-          setPopoverPosition("below")
-        }
-      }
-
-      // Calculate horizontal position (centered under the button)
-      const buttonCenter = buttonRect.left + (buttonRect.width / 2)
-      let left = buttonCenter - (popoverWidth / 2)
-
-      // Ensure it doesn't go off left edge
-      if (left < 8) {
-        left = 8
-      }
-      // Ensure it doesn't go off right edge
-      if (left + popoverWidth > window.innerWidth - 8) {
-        left = window.innerWidth - popoverWidth - 8
-      }
-
-      setPopoverStyle({ top, left, isReady: true })
+    return () => {
+      cancelAnimationFrame(rafId)
+      window.removeEventListener("resize", updatePosition)
     }
   }, [showFilters])
-
-  // Recalculate position on window resize
-  useEffect(() => {
-    function handleResize() {
-      if (showFilters && filterButtonRef.current) {
-        const buttonRect = filterButtonRef.current.getBoundingClientRect()
-        const popoverHeight = Math.min(400, window.innerHeight * 0.7)
-        const popoverWidth = window.innerWidth < 640 ? 320 : 384
-
-        let top = popoverPosition === "below"
-          ? buttonRect.bottom + 8
-          : buttonRect.top - popoverHeight - 8
-
-        if (top < 8) top = 8
-
-        // Center horizontally
-        const buttonCenter = buttonRect.left + (buttonRect.width / 2)
-        let left = buttonCenter - (popoverWidth / 2)
-
-        if (left < 8) left = 8
-        if (left + popoverWidth > window.innerWidth - 8) {
-          left = window.innerWidth - popoverWidth - 8
-        }
-
-        setPopoverStyle({ top, left, isReady: true })
-      }
-    }
-
-    window.addEventListener("resize", handleResize)
-    return () => window.removeEventListener("resize", handleResize)
-  }, [showFilters, popoverPosition])
 
   // Close filter panel when clicking outside
   useEffect(() => {
@@ -509,11 +495,11 @@ export function PlaylistTable({
         <div className="relative flex-1 max-w-md">
           <input
             type="text"
-            placeholder="Search playlists or paste a Spotify playlist URL…"
+            placeholder="Search playlists or paste Spotify / Apple Music URL…"
             value={searchQuery}
             onChange={(e) => onSearchChange(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && isSpotifyUrl && !isImporting) {
+              if (e.key === "Enter" && isImportableUrl && !isImporting) {
                 e.preventDefault()
                 handleImportClick()
               }
@@ -551,16 +537,26 @@ export function PlaylistTable({
         <button
           type="button"
           onClick={handleImportClick}
-          disabled={!isSpotifyUrl || isImporting}
-          aria-label="Import public Spotify playlist"
+          disabled={!isImportableUrl || isImporting}
+          aria-label={
+            detectedUrlType === "apple-music"
+              ? "Import public Apple Music playlist"
+              : detectedUrlType === "spotify"
+              ? "Import public Spotify playlist"
+              : "Import public playlist"
+          }
           title={
-            isSpotifyUrl
+            detectedUrlType === "apple-music"
+              ? "Import this public Apple Music playlist"
+              : detectedUrlType === "spotify"
               ? "Import this public Spotify playlist"
-              : "Paste a Spotify playlist URL to enable import"
+              : "Paste a Spotify or Apple Music playlist URL to enable import"
           }
           className={`flex items-center gap-2 rounded-lg px-4 py-2 text-sm font-medium shadow-sm transition-all ${
-            isSpotifyUrl && !isImporting
-              ? "bg-green-600 text-white hover:bg-green-700 cursor-pointer"
+            isImportableUrl && !isImporting
+              ? detectedUrlType === "apple-music"
+                ? "bg-rose-600 text-white hover:bg-rose-700 cursor-pointer"
+                : "bg-green-600 text-white hover:bg-green-700 cursor-pointer"
               : "bg-zinc-100 text-zinc-400 dark:bg-zinc-800 dark:text-zinc-500 cursor-not-allowed"
           }`}
         >
@@ -577,7 +573,13 @@ export function PlaylistTable({
               <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v2a2 2 0 002 2h12a2 2 0 002-2v-2M7 10l5-5 5 5M12 5v12" />
               </svg>
-              <span>Import</span>
+              <span>
+                {detectedUrlType === "apple-music"
+                  ? "Import Apple Music"
+                  : detectedUrlType === "spotify"
+                  ? "Import Spotify"
+                  : "Import"}
+              </span>
             </>
           )}
         </button>
@@ -617,7 +619,7 @@ export function PlaylistTable({
             {showFilters && popoverStyle.isReady && typeof document !== 'undefined' && createPortal(
               <div
                 ref={filterPanelRef}
-                className={`fixed z-[9999] popover-enter ${popoverPosition === "below" ? "popover-enter-below" : "popover-enter-above"}`}
+                className={`fixed z-[9999] popover-enter ${popoverStyle.placement === "below" ? "popover-enter-below" : "popover-enter-above"}`}
                 style={{
                   top: `${popoverStyle.top}px`,
                   left: `${popoverStyle.left}px`
@@ -1060,8 +1062,32 @@ export function PlaylistTable({
                       )}
                     </td>
                     <td className="px-2 py-2 w-72">
-                      <div className="font-medium text-sm text-zinc-900 dark:text-zinc-100 truncate" title={item.name}>
-                        {item.name}
+                      <div className="flex items-center gap-2">
+                        <span className="font-medium text-sm text-zinc-900 dark:text-zinc-100 truncate" title={item.name}>
+                          {item.name}
+                        </span>
+                        {item.provider && (
+                          <span
+                            className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium tracking-wide uppercase shrink-0 ${
+                              item.provider === "apple-music"
+                                ? "bg-rose-50 text-rose-700 border border-rose-200 dark:bg-rose-950/40 dark:text-rose-300 dark:border-rose-900"
+                                : item.provider === "spotify"
+                                ? "bg-emerald-50 text-emerald-700 border border-emerald-200 dark:bg-emerald-950/40 dark:text-emerald-300 dark:border-emerald-900"
+                                : "bg-blue-50 text-blue-700 border border-blue-200 dark:bg-blue-950/40 dark:text-blue-300 dark:border-blue-900"
+                            }`}
+                          >
+                            {item.provider === "apple-music"
+                              ? "Apple Music"
+                              : item.provider === "spotify"
+                              ? "Spotify"
+                              : "Navidrome"}
+                          </span>
+                        )}
+                        {item.isImported && !item.provider && (
+                          <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium tracking-wide uppercase shrink-0 bg-zinc-100 text-zinc-600 border border-zinc-200 dark:bg-zinc-800 dark:text-zinc-300 dark:border-zinc-700">
+                            Imported
+                          </span>
+                        )}
                       </div>
                     </td>
                     <td className="px-2 py-2 text-sm text-zinc-600 dark:text-zinc-400">
