@@ -1,8 +1,10 @@
 'use client';
-
+ 
 import { useState } from 'react';
 import { ResultsReportProps } from './types';
 import { TrackMatch } from '@/types/matching';
+import { useDownloader } from '@/lib/downloader/downloader-context';
+import { Download, RefreshCw, CheckCircle2 } from 'lucide-react';
 
 const formatNumber = (num: number): string => num.toLocaleString();
 
@@ -92,9 +94,19 @@ interface UnmatchedTrackItemProps {
   match: TrackMatch;
   index: number;
   onViewDetails?: (trackId: string) => void;
+  onQueueTrack?: () => void;
+  queueStatus?: 'queued' | 'loading' | 'failed';
+  canQueue?: boolean;
 }
 
-function UnmatchedTrackItem({ match, index, onViewDetails }: UnmatchedTrackItemProps) {
+function UnmatchedTrackItem({
+  match,
+  index,
+  onViewDetails,
+  onQueueTrack,
+  queueStatus,
+  canQueue,
+}: UnmatchedTrackItemProps) {
   const [isExpanded, setIsExpanded] = useState(false);
 
   return (
@@ -115,6 +127,12 @@ function UnmatchedTrackItem({ match, index, onViewDetails }: UnmatchedTrackItemP
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {canQueue && queueStatus === 'queued' && (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-300">
+              <CheckCircle2 className="w-3 h-3" />
+              Queued
+            </span>
+          )}
           <span className="px-2 py-1 text-xs font-medium rounded bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-400">
             {match.matchStrategy === 'none' ? 'No match' : match.matchStrategy}
           </span>
@@ -162,14 +180,39 @@ function UnmatchedTrackItem({ match, index, onViewDetails }: UnmatchedTrackItemP
               </div>
             )}
           </div>
-          {onViewDetails && (
-            <button
-              onClick={() => onViewDetails(match.spotifyTrack?.id || match.track?.id || match.trackKey)}
-              className="mt-3 text-sm text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300"
-            >
-              View Details →
-            </button>
-          )}
+          <div className="mt-3 flex items-center justify-between">
+            {onViewDetails && (
+              <button
+                onClick={() => onViewDetails(match.spotifyTrack?.id || match.track?.id || match.trackKey)}
+                className="text-sm text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 cursor-pointer"
+              >
+                View Details
+              </button>
+            )}
+            {canQueue && (
+              <div>
+                {queueStatus === 'queued' ? (
+                  <span className="inline-flex items-center gap-1.5 text-xs text-green-600 dark:text-green-400 font-medium">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    Queued in Downloader
+                  </span>
+                ) : queueStatus === 'loading' ? (
+                  <span className="inline-flex items-center gap-1.5 text-xs text-blue-600 dark:text-blue-400 font-medium">
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    Queueing...
+                  </span>
+                ) : (
+                  <button
+                    onClick={onQueueTrack}
+                    className="inline-flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    Download Track
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -177,12 +220,80 @@ function UnmatchedTrackItem({ match, index, onViewDetails }: UnmatchedTrackItemP
 }
 
 export function ResultsReport({ result, onExportAgain, onBackToDashboard, onViewDetails }: ResultsReportProps) {
+  const { config, queueTrack, batchQueueTracks } = useDownloader();
   const [showUnmatchedOnly, setShowUnmatchedOnly] = useState(true);
+  const [trackQueueStatus, setTrackQueueStatus] = useState<Record<string, 'queued' | 'loading' | 'failed'>>({});
+  const [batchProgress, setBatchProgress] = useState<{ running: boolean; current: number; total: number } | null>(null);
+
+  const getMatchKey = (match: TrackMatch) =>
+    match.spotifyTrack?.uri || match.spotifyTrack?.id || match.track?.uri || match.track?.id || match.trackKey;
 
   const unmatchedMatches = result.matches.filter(m => m.status !== 'matched');
   const matchRate = result.statistics.total > 0
     ? Math.round((result.statistics.matched / result.statistics.total) * 100)
     : 0;
+
+  const handleQueueAllUnmatched = async () => {
+    if (unmatchedMatches.length === 0 || batchProgress?.running) return;
+
+    setBatchProgress({ running: true, current: 0, total: unmatchedMatches.length });
+    const tracksToQueue = unmatchedMatches.map((m) => ({
+      title: m.spotifyTrack?.name || m.track?.title || '',
+      artist:
+        m.spotifyTrack?.artists?.map((a) => a.name).join(', ') ||
+        m.track?.artists?.map((a) => a.name).join(', ') ||
+        '',
+      album: m.spotifyTrack?.album?.name || m.track?.album?.name,
+    }));
+
+    try {
+      await batchQueueTracks(tracksToQueue, (current, total, currentSong) => {
+        setBatchProgress({ running: true, current, total });
+        if (currentSong) {
+          const found = unmatchedMatches.find((m) => {
+            const title = m.spotifyTrack?.name || m.track?.title || '';
+            const artist =
+              m.spotifyTrack?.artists?.map((a) => a.name).join(', ') ||
+              m.track?.artists?.map((a) => a.name).join(', ') ||
+              '';
+            return `${artist} - ${title}`.toLowerCase() === currentSong.toLowerCase();
+          });
+          if (found) {
+            setTrackQueueStatus((prev) => ({ ...prev, [getMatchKey(found)]: 'queued' }));
+          }
+        }
+      });
+      const allQueued: Record<string, 'queued'> = {};
+      unmatchedMatches.forEach((m) => {
+        allQueued[getMatchKey(m)] = 'queued';
+      });
+      setTrackQueueStatus((prev) => ({ ...prev, ...allQueued }));
+    } finally {
+      setBatchProgress(null);
+    }
+  };
+
+  const handleQueueSingle = async (match: TrackMatch) => {
+    const key = getMatchKey(match);
+    setTrackQueueStatus((prev) => ({ ...prev, [key]: 'loading' }));
+    try {
+      const res = await queueTrack({
+        title: match.spotifyTrack?.name || match.track?.title || '',
+        artist:
+          match.spotifyTrack?.artists?.map((a) => a.name).join(', ') ||
+          match.track?.artists?.map((a) => a.name).join(', ') ||
+          '',
+        album: match.spotifyTrack?.album?.name || match.track?.album?.name,
+      });
+      if (res.success) {
+        setTrackQueueStatus((prev) => ({ ...prev, [key]: 'queued' }));
+      } else {
+        setTrackQueueStatus((prev) => ({ ...prev, [key]: 'failed' }));
+      }
+    } catch {
+      setTrackQueueStatus((prev) => ({ ...prev, [key]: 'failed' }));
+    }
+  };
 
   return (
     <div className="w-full max-w-4xl mx-auto">
@@ -275,32 +386,62 @@ export function ResultsReport({ result, onExportAgain, onBackToDashboard, onView
 
           {unmatchedMatches.length > 0 && (
             <div>
-              <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
                 <h3 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">
                   Unmatched Tracks ({unmatchedMatches.length})
                 </h3>
-                <label className="flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-400">
-                  <input
-                    type="checkbox"
-                    checked={showUnmatchedOnly}
-                    onChange={(e) => setShowUnmatchedOnly(e.target.checked)}
-                    className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                  />
-                  Show unmatched only
-                </label>
+                <div className="flex items-center gap-3">
+                  {config.enabled && (
+                    <button
+                      onClick={handleQueueAllUnmatched}
+                      disabled={batchProgress?.running}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+                      title="Queue all missing tracks to FlacDownloader"
+                    >
+                      {batchProgress?.running ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>
+                            Queueing ({batchProgress.current}/{batchProgress.total})...
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <Download className="w-3.5 h-3.5" />
+                          <span>Queue Missing in Downloader ({unmatchedMatches.length})</span>
+                        </>
+                      )}
+                    </button>
+                  )}
+                  <label className="flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-400">
+                    <input
+                      type="checkbox"
+                      checked={showUnmatchedOnly}
+                      onChange={(e) => setShowUnmatchedOnly(e.target.checked)}
+                      className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                    />
+                    Show unmatched only
+                  </label>
+                </div>
               </div>
               <div className="space-y-3 max-h-96 overflow-y-auto">
                 {(showUnmatchedOnly ? unmatchedMatches : result.matches)
                   .filter(m => m.status !== 'matched' || !showUnmatchedOnly)
                   .slice(0, 20)
-                  .map((match, index) => (
-                    <UnmatchedTrackItem
-                      key={match.spotifyTrack?.uri || match.spotifyTrack?.id || match.track?.uri || match.trackKey}
-                      match={match}
-                      index={index}
-                      onViewDetails={onViewDetails}
-                    />
-                  ))}
+                  .map((match, index) => {
+                    const matchKey = getMatchKey(match);
+                    return (
+                      <UnmatchedTrackItem
+                        key={matchKey}
+                        match={match}
+                        index={index}
+                        onViewDetails={onViewDetails}
+                        onQueueTrack={() => handleQueueSingle(match)}
+                        queueStatus={trackQueueStatus[matchKey]}
+                        canQueue={config.enabled}
+                      />
+                    );
+                  })}
                 {result.matches.length > 20 && (
                   <p className="text-center text-sm text-zinc-500 dark:text-zinc-400 py-2">
                     Showing 20 of {result.matches.length} tracks

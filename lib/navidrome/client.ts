@@ -1032,6 +1032,86 @@ export class NavidromeApiClient {
     return this._ndClientId;
   }
 
+  /**
+   * Initiates a library scan in Navidrome using the Subsonic API endpoint.
+   *
+   * @param signal - Optional AbortSignal to cancel the request
+   * @returns Promise resolving to scan status details (scanning boolean and count)
+   */
+  async startScan(signal?: AbortSignal): Promise<{
+    success: boolean;
+    scanning?: boolean;
+    count?: number;
+    error?: string;
+  }> {
+    try {
+      const url = this._buildSubsonicUrl('/rest/startScan');
+      const response = await fetch(url, { signal });
+
+      if (!response.ok) {
+        return { success: false, error: `HTTP error: ${response.status} ${response.statusText}` };
+      }
+
+      const data = await response.json();
+      const subResponse = data['subsonic-response'];
+      if (subResponse?.status === 'failed') {
+        return { success: false, error: subResponse?.error?.message || 'Start scan failed' };
+      }
+
+      const scanStatus = subResponse?.scanStatus;
+      return {
+        success: true,
+        scanning: Boolean(scanStatus?.scanning),
+        count: typeof scanStatus?.count === 'number' ? scanStatus.count : undefined,
+      };
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw error;
+      }
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
+  /**
+   * Retrieves the current library scan status from Navidrome using the Subsonic API endpoint.
+   *
+   * @param signal - Optional AbortSignal to cancel the request
+   * @returns Promise resolving to scan status details (scanning boolean and count)
+   */
+  async getScanStatus(signal?: AbortSignal): Promise<{
+    success: boolean;
+    scanning?: boolean;
+    count?: number;
+    error?: string;
+  }> {
+    try {
+      const url = this._buildSubsonicUrl('/rest/getScanStatus');
+      const response = await fetch(url, { signal });
+
+      if (!response.ok) {
+        return { success: false, error: `HTTP error: ${response.status} ${response.statusText}` };
+      }
+
+      const data = await response.json();
+      const subResponse = data['subsonic-response'];
+      if (subResponse?.status === 'failed') {
+        return { success: false, error: subResponse?.error?.message || 'Get scan status failed' };
+      }
+
+      const scanStatus = subResponse?.scanStatus;
+      return {
+        success: true,
+        scanning: Boolean(scanStatus?.scanning),
+        count: typeof scanStatus?.count === 'number' ? scanStatus.count : undefined,
+      };
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw error;
+      }
+      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' };
+    }
+  }
+
   private _mapPlaylist(item: NavidromePlaylist): NavidromePlaylist {
     return {
       id: item.id,

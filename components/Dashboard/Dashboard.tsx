@@ -20,6 +20,7 @@ import { PlaylistTable } from "@/components/Dashboard/PlaylistTable"
 import { ExportLayoutManager } from "@/components/Dashboard/ExportLayoutManager"
 import { SoundiizTransferHeader } from "@/components/Dashboard/SoundiizTransferHeader"
 import { AppleMusicCredentialsModal } from "@/components/apple-music-credentials-modal"
+import { useDownloader } from "@/lib/downloader/downloader-context"
 import { error as logError } from "@/lib/support/debug-log"
 
 import { ConfirmationPopup } from "@/components/Dashboard/ConfirmationPopup"
@@ -109,6 +110,7 @@ export function Dashboard() {
     refreshAppleMusicPlaylists,
   } = useAuth()
   const toast = useToast()
+  const { config: downloaderConfig, batchQueueTracks } = useDownloader()
   const [tableItems, setTableItems] = useState<PlaylistTableItem[]>([])
   const [importedPlaylists, setImportedPlaylists] = useState<ImportedPlaylist[]>(() =>
     getJSON<ImportedPlaylist[]>(IMPORTED_STORAGE_KEY, []),
@@ -1114,6 +1116,27 @@ export function Dashboard() {
         fuzzyThreshold: 0.8,
       }
 
+      const allExportUnmatchedTracks: { title: string; artist: string; album?: string }[] = []
+      const maybeAutoQueueUnmatched = () => {
+        if (
+          downloaderConfig.enabled &&
+          downloaderConfig.autoQueueUnmatched &&
+          allExportUnmatchedTracks.length > 0
+        ) {
+          batchQueueTracks(allExportUnmatchedTracks)
+            .then((res) => {
+              if (res.queued > 0) {
+                toast.showSuccess(
+                  `Automatically queued ${res.queued} missing tracks in Music Downloader.`
+                )
+              }
+            })
+            .catch((err) => {
+              logError("Auto-queue failed:", err)
+            })
+        }
+      }
+
       for (let i = 0; i < itemsToExport.length; i++) {
         const item = itemsToExport[i]
         const itemSnapshotId = item.snapshot_id || ""
@@ -1372,6 +1395,13 @@ export function Dashboard() {
 
         setCurrentUnmatchedPlaylistId(item.id)
         setUnmatchedSongs(unmatchedSongsList)
+        unmatchedSongsList.forEach((s) => {
+          allExportUnmatchedTracks.push({
+            title: s.title,
+            artist: s.artist,
+            album: s.album,
+          })
+        })
 
         progress = updateProgress(progress, {
           phase: "exporting",
@@ -1502,6 +1532,7 @@ export function Dashboard() {
             toast.showSuccess("Export completed successfully!")
             isExportingRef.current = false
             setIsExporting(false)
+            maybeAutoQueueUnmatched()
           }
         } else {
           const forceCreate = forceExportPlaylists
@@ -1673,6 +1704,7 @@ export function Dashboard() {
           toast.showSuccess("Export completed successfully!")
           isExportingRef.current = false
           setIsExporting(false)
+          maybeAutoQueueUnmatched()
         }
       }
     } catch (err) {

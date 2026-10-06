@@ -1,7 +1,8 @@
 "use client"
 
 import React, { useState, useMemo } from "react"
-import { Disc } from "lucide-react"
+import { Disc, Download, RefreshCw, CheckCircle2 } from "lucide-react"
+import { useDownloader } from "@/lib/downloader/downloader-context"
 
 export interface Song {
   spotifyTrackId: string
@@ -35,7 +36,85 @@ export function SongsPanel({
   isLoading = false,
   statistics,
 }: SongsPanelProps) {
+  const { config, queueTrack, batchQueueTracks } = useDownloader()
   const [showUnmatchedOnly, setShowUnmatchedOnly] = useState(false)
+  const [trackStatus, setTrackStatus] = useState<Record<string, "queued" | "loading" | "failed">>({})
+  const [batchProgress, setBatchProgress] = useState<{
+    running: boolean
+    current: number
+    total: number
+  } | null>(null)
+
+  const failedSongsCount = useMemo(() => {
+    let count = 0
+    playlistGroups.forEach((g) => {
+      g.songs.forEach((s) => {
+        if (s.exportStatus === "failed") count++
+      })
+    })
+    return count
+  }, [playlistGroups])
+
+  const handleQueueSingleSong = async (song: Song) => {
+    setTrackStatus((prev) => ({ ...prev, [song.spotifyTrackId]: "loading" }))
+    try {
+      const res = await queueTrack({
+        title: song.title,
+        artist: song.artist,
+        album: song.album,
+      })
+      if (res.success) {
+        setTrackStatus((prev) => ({ ...prev, [song.spotifyTrackId]: "queued" }))
+      } else {
+        setTrackStatus((prev) => ({ ...prev, [song.spotifyTrackId]: "failed" }))
+      }
+    } catch {
+      setTrackStatus((prev) => ({ ...prev, [song.spotifyTrackId]: "failed" }))
+    }
+  }
+
+  const handleQueueAllFailed = async () => {
+    const failedSongs: Song[] = []
+    playlistGroups.forEach((group) => {
+      group.songs.forEach((song) => {
+        if (song.exportStatus === "failed") {
+          failedSongs.push(song)
+        }
+      })
+    })
+
+    if (failedSongs.length === 0 || batchProgress?.running) return
+
+    setBatchProgress({ running: true, current: 0, total: failedSongs.length })
+    try {
+      await batchQueueTracks(
+        failedSongs.map((s) => ({
+          title: s.title,
+          artist: s.artist,
+          album: s.album,
+        })),
+        (current, total, currentSong) => {
+          setBatchProgress({ running: true, current, total })
+          if (currentSong) {
+            const found = failedSongs.find(
+              (s) => `${s.artist} - ${s.title}`.toLowerCase() === currentSong.toLowerCase()
+            )
+            if (found) {
+              setTrackStatus((prev) => ({ ...prev, [found.spotifyTrackId]: "queued" }))
+            }
+          }
+        }
+      )
+
+      const allQueued: Record<string, "queued"> = {}
+      failedSongs.forEach((s) => {
+        allQueued[s.spotifyTrackId] = "queued"
+      })
+      setTrackStatus((prev) => ({ ...prev, ...allQueued }))
+    } finally {
+      setBatchProgress(null)
+    }
+  }
 
   const filteredGroups = useMemo(() => {
     if (!showUnmatchedOnly) {
@@ -237,6 +316,28 @@ export function SongsPanel({
               </svg>
               Download
             </button>
+            {config.enabled && failedSongsCount > 0 && (
+              <button
+                onClick={handleQueueAllFailed}
+                disabled={batchProgress?.running}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-white bg-blue-600 hover:bg-blue-700 dark:bg-blue-600 dark:hover:bg-blue-500 rounded transition-colors cursor-pointer disabled:opacity-50"
+                title="Queue all failed/unmatched tracks in FlacDownloader"
+              >
+                {batchProgress?.running ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    <span>
+                      Queueing ({batchProgress.current}/{batchProgress.total})...
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Queue Missing ({failedSongsCount})</span>
+                  </>
+                )}
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -247,7 +348,7 @@ export function SongsPanel({
               <th className="px-4 py-2 text-left text-xs font-medium uppercase tracking-wider text-zinc-500 dark:text-zinc-400 w-[5%]">
                 #
               </th>
-              <th className="px-4 py-2 text-left text-xs font-medium uppercase tracking-wider text-zinc-500 dark:text-zinc-400 w-[40%]">
+              <th className="px-4 py-2 text-left text-xs font-medium uppercase tracking-wider text-zinc-500 dark:text-zinc-400 w-[35%]">
                 Title
               </th>
               <th className="px-4 py-2 text-left text-xs font-medium uppercase tracking-wider text-zinc-500 dark:text-zinc-400 w-[25%]">
@@ -259,6 +360,11 @@ export function SongsPanel({
               <th className="px-4 py-2 text-left text-xs font-medium uppercase tracking-wider text-zinc-500 dark:text-zinc-400 w-[10%]">
                 Duration
               </th>
+              {config.enabled && (
+                <th className="px-4 py-2 text-right text-xs font-medium uppercase tracking-wider text-zinc-500 dark:text-zinc-400 w-[15%]">
+                  Action
+                </th>
+              )}
             </tr>
           </thead>
           <tbody>
@@ -267,7 +373,7 @@ export function SongsPanel({
                 {/* Section Header */}
                 <tr>
                   <td
-                    colSpan={5}
+                    colSpan={config.enabled ? 6 : 5}
                     className="bg-zinc-100 dark:bg-zinc-800 px-4 py-2 font-semibold text-sm border-t-2 border-zinc-300 dark:border-zinc-700"
                   >
                     <div className="flex items-center gap-2">
@@ -291,43 +397,73 @@ export function SongsPanel({
                   </td>
                 </tr>
                 {/* Tracks */}
-                {group.songs.map((song, index) => (
-                  <tr
-                    key={`${group.playlistId}-${index}`}
-                    className={`hover:bg-zinc-50 dark:hover:bg-zinc-800/50 transition-colors border-b border-zinc-200 dark:border-zinc-800 ${
-                      song.exportStatus === "exported"
-                        ? "bg-green-50 dark:bg-green-900/20"
-                        : song.exportStatus === "failed"
-                          ? "bg-red-50 dark:bg-red-900/20"
-                          : ""
-                    }`}
-                  >
-                    <td className="px-4 py-2 text-sm text-zinc-500 dark:text-zinc-400">
-                      {index + 1}
-                    </td>
-                    <td
-                      className="px-4 py-2 text-sm text-zinc-900 dark:text-zinc-100 truncate max-w-[200px]"
-                      title={song.title}
+                {group.songs.map((song, index) => {
+                  const status = trackStatus[song.spotifyTrackId]
+
+                  return (
+                    <tr
+                      key={`${group.playlistId}-${index}`}
+                      className={`hover:bg-zinc-50 dark:hover:bg-zinc-800/50 transition-colors border-b border-zinc-200 dark:border-zinc-800 ${
+                        song.exportStatus === "exported"
+                          ? "bg-green-50 dark:bg-green-900/20"
+                          : song.exportStatus === "failed"
+                            ? "bg-red-50 dark:bg-red-900/20"
+                            : ""
+                      }`}
                     >
-                      {song.title}
-                    </td>
-                    <td
-                      className="px-4 py-2 text-sm text-zinc-600 dark:text-zinc-400 truncate max-w-[120px]"
-                      title={song.album}
-                    >
-                      {song.album}
-                    </td>
-                    <td
-                      className="px-4 py-2 text-sm text-zinc-600 dark:text-zinc-400 truncate max-w-[120px]"
-                      title={song.artist}
-                    >
-                      {song.artist}
-                    </td>
-                    <td className="px-4 py-2 text-sm text-zinc-500 dark:text-zinc-400">
-                      {song.duration}
-                    </td>
-                  </tr>
-                ))}
+                      <td className="px-4 py-2 text-sm text-zinc-500 dark:text-zinc-400">
+                        {index + 1}
+                      </td>
+                      <td
+                        className="px-4 py-2 text-sm text-zinc-900 dark:text-zinc-100 truncate max-w-[200px]"
+                        title={song.title}
+                      >
+                        {song.title}
+                      </td>
+                      <td
+                        className="px-4 py-2 text-sm text-zinc-600 dark:text-zinc-400 truncate max-w-[120px]"
+                        title={song.album}
+                      >
+                        {song.album}
+                      </td>
+                      <td
+                        className="px-4 py-2 text-sm text-zinc-600 dark:text-zinc-400 truncate max-w-[120px]"
+                        title={song.artist}
+                      >
+                        {song.artist}
+                      </td>
+                      <td className="px-4 py-2 text-sm text-zinc-500 dark:text-zinc-400">
+                        {song.duration}
+                      </td>
+                      {config.enabled && (
+                        <td className="px-4 py-2 text-right text-sm">
+                          {song.exportStatus === "failed" ? (
+                            status === "queued" ? (
+                              <span className="inline-flex items-center gap-1 text-xs text-green-600 dark:text-green-400 font-medium">
+                                <CheckCircle2 className="h-3.5 w-3.5" />
+                                Queued
+                              </span>
+                            ) : status === "loading" ? (
+                              <span className="inline-flex items-center gap-1 text-xs text-blue-600 dark:text-blue-400 font-medium">
+                                <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                                Queueing...
+                              </span>
+                            ) : (
+                              <button
+                                onClick={() => handleQueueSingleSong(song)}
+                                className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded transition-colors cursor-pointer"
+                                title="Queue track in FlacDownloader"
+                              >
+                                <Download className="h-3.5 w-3.5" />
+                                Download
+                              </button>
+                            )
+                          ) : null}
+                        </td>
+                      )}
+                    </tr>
+                  )
+                })}
               </React.Fragment>
             ))}
           </tbody>

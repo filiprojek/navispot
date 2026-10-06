@@ -31,6 +31,7 @@ function createMockDestination(overrides?: Partial<DestinationProvider>): Destin
     id: 'navidrome',
     name: 'Navidrome Mock',
     isConnected: vi.fn().mockReturnValue(true),
+    isAuthenticated: vi.fn().mockReturnValue(true),
     searchByIsrc: vi.fn().mockResolvedValue([]),
     searchByQuery: vi.fn().mockResolvedValue([]),
     createPlaylist: vi.fn().mockResolvedValue({ id: 'mock-pl-123', success: true }),

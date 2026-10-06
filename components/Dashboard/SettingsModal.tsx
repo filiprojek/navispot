@@ -7,6 +7,9 @@ import {
   DashboardLayout,
   DASHBOARD_LAYOUT_OPTIONS,
 } from "@/lib/layout/dashboard-layout"
+import { useDownloader } from "@/lib/downloader/downloader-context"
+import { DownloaderFormat } from "@/types/downloader"
+import { CheckCircle2, AlertCircle, RefreshCw, Server, Key, Music } from "lucide-react"
 
 interface SettingsModalProps {
   isOpen: boolean
@@ -20,7 +23,7 @@ interface SettingsModalProps {
   onExportPlaylistsAsPublicChange: (isPublic: boolean) => void
 }
 
-type SettingsSection = "data" | "layout" | "export"
+type SettingsSection = "data" | "layout" | "export" | "downloader"
 
 interface UnstarProgress {
   processed: number
@@ -45,9 +48,23 @@ export function SettingsModal({
   onExportPlaylistsAsPublicChange,
 }: SettingsModalProps) {
   const { navidrome } = useAuth()
+  const {
+    config: downloaderConfig,
+    updateConfig: updateDownloaderConfig,
+    status: downloaderStatus,
+    isChecking: isCheckingDownloader,
+    checkConnection: checkDownloaderConnection,
+    triggerNavidromeScan,
+  } = useDownloader()
+
   const [activeSection, setActiveSection] = useState<SettingsSection>("data")
   const [showConfirm, setShowConfirm] = useState(false)
   const [status, setStatus] = useState<ActionStatus>({ kind: "idle" })
+  const [scanStatus, setScanStatus] = useState<{
+    running: boolean
+    message: string | null
+    success: boolean | null
+  }>({ running: false, message: null, success: null })
 
   const isConnected =
     navidrome.isConnected &&
@@ -228,6 +245,20 @@ export function SettingsModal({
                 }`}
               >
                 Export
+              </button>
+              <button
+                role="tab"
+                aria-selected={activeSection === "downloader"}
+                aria-controls="settings-panel-downloader"
+                id="settings-tab-downloader"
+                onClick={() => setActiveSection("downloader")}
+                className={`px-4 py-1.5 rounded-md text-sm font-medium transition-all cursor-pointer ${
+                  activeSection === "downloader"
+                    ? "bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 shadow-sm"
+                    : "text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
+                }`}
+              >
+                Downloader
               </button>
             </div>
           </div>
@@ -488,6 +519,258 @@ export function SettingsModal({
                 </div>
               </div>
             )}
+
+            {activeSection === "downloader" && (
+              <div
+                role="tabpanel"
+                id="settings-panel-downloader"
+                aria-labelledby="settings-tab-downloader"
+                className="space-y-6"
+              >
+                <div>
+                  <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
+                    Music Downloader
+                  </h3>
+                  <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                    Connect to your self-hosted FlacDownloader instance to automatically or manually obtain missing audio files.
+                  </p>
+                </div>
+
+                {/* Enable toggle */}
+                <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 p-4">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="flex-1 min-w-0">
+                      <h4 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                        Enable Music Downloader
+                      </h4>
+                      <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                        Allow queueing missing or unmatched tracks directly to FlacDownloader.
+                      </p>
+                    </div>
+                    <button
+                      role="switch"
+                      aria-checked={downloaderConfig.enabled}
+                      onClick={() =>
+                        updateDownloaderConfig({ enabled: !downloaderConfig.enabled })
+                      }
+                      className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${
+                        downloaderConfig.enabled
+                          ? "bg-green-500"
+                          : "bg-zinc-200 dark:bg-zinc-700"
+                      }`}
+                    >
+                      <span
+                        aria-hidden="true"
+                        className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-white shadow-lg ring-0 transition-transform ${
+                          downloaderConfig.enabled
+                            ? "translate-x-5"
+                            : "translate-x-0"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Connection Settings */}
+                <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 p-4 space-y-4">
+                  <h4 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                    Connection Settings
+                  </h4>
+
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                      Daemon Endpoint URL
+                    </label>
+                    <div className="relative">
+                      <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-zinc-400">
+                        <Server className="h-4 w-4" />
+                      </div>
+                      <input
+                        type="url"
+                        value={downloaderConfig.url}
+                        onChange={(e) => updateDownloaderConfig({ url: e.target.value })}
+                        placeholder="http://127.0.0.1:8787"
+                        className="w-full pl-9 pr-3 py-2 text-sm rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-green-500"
+                      />
+                    </div>
+                    <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                      Requests are proxied server-side via Next.js to avoid CORS or mixed-content issues.
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                      API Key
+                    </label>
+                    <div className="relative">
+                      <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-zinc-400">
+                        <Key className="h-4 w-4" />
+                      </div>
+                      <input
+                        type="password"
+                        value={downloaderConfig.apiKey}
+                        onChange={(e) => updateDownloaderConfig({ apiKey: e.target.value })}
+                        placeholder="flacdownloader"
+                        className="w-full pl-9 pr-3 py-2 text-sm rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-green-500"
+                      />
+                    </div>
+                    <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                      Configured on host container via FLACDOWNLOADER_API_KEY (default: flacdownloader).
+                    </p>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">
+                      Preferred Audio Format
+                    </label>
+                    <div className="relative">
+                      <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-zinc-400">
+                        <Music className="h-4 w-4" />
+                      </div>
+                      <select
+                        value={downloaderConfig.format}
+                        onChange={(e) =>
+                          updateDownloaderConfig({ format: e.target.value as DownloaderFormat })
+                        }
+                        className="w-full pl-9 pr-3 py-2 text-sm rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-green-500 cursor-pointer"
+                      >
+                        <option value="flac">FLAC (Lossless 16/24-bit)</option>
+                        <option value="mp3_320">MP3 320 kbps (High Quality)</option>
+                        <option value="mp3_128">MP3 128 kbps (Standard)</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="pt-2 flex items-center justify-between">
+                    <button
+                      type="button"
+                      onClick={() => checkDownloaderConnection()}
+                      disabled={isCheckingDownloader}
+                      className="px-4 py-2 text-sm font-medium rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-2"
+                    >
+                      {isCheckingDownloader && <RefreshCw className="h-4 w-4 animate-spin" />}
+                      Test Connection
+                    </button>
+
+                    {downloaderStatus && (
+                      <div
+                        className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium ${
+                          downloaderStatus.connected
+                            ? "bg-green-100 text-green-800 dark:bg-green-950/50 dark:text-green-300"
+                            : "bg-red-100 text-red-800 dark:bg-red-950/50 dark:text-red-300"
+                        }`}
+                      >
+                        {downloaderStatus.connected ? (
+                          <>
+                            <CheckCircle2 className="h-3.5 w-3.5" />
+                            <span>
+                              Connected ({downloaderStatus.queueCount} in queue)
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <AlertCircle className="h-3.5 w-3.5" />
+                            <span>
+                              Failed: {downloaderStatus.error || downloaderStatus.statusText}
+                            </span>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Auto-queue option */}
+                <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 p-4">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="flex-1 min-w-0">
+                      <h4 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                        Auto-queue Unmatched Tracks
+                      </h4>
+                      <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                        Automatically search and queue all missing tracks in FlacDownloader after exporting a playlist.
+                      </p>
+                    </div>
+                    <button
+                      role="switch"
+                      aria-checked={downloaderConfig.autoQueueUnmatched}
+                      onClick={() =>
+                        updateDownloaderConfig({
+                          autoQueueUnmatched: !downloaderConfig.autoQueueUnmatched,
+                        })
+                      }
+                      className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${
+                        downloaderConfig.autoQueueUnmatched
+                          ? "bg-green-500"
+                          : "bg-zinc-200 dark:bg-zinc-700"
+                      }`}
+                    >
+                      <span
+                        aria-hidden="true"
+                        className={`pointer-events-none inline-block h-5 w-5 rounded-full bg-white shadow-lg ring-0 transition-transform ${
+                          downloaderConfig.autoQueueUnmatched
+                            ? "translate-x-5"
+                            : "translate-x-0"
+                        }`}
+                      />
+                    </button>
+                  </div>
+                </div>
+
+                {/* Navidrome Library Scan */}
+                <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 p-4">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="flex-1 min-w-0">
+                      <h4 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                        Trigger Navidrome Library Scan
+                      </h4>
+                      <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                        Prompts Navidrome to scan media folders for newly downloaded tracks so they appear in searches and playlists.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={async () => {
+                        setScanStatus({ running: true, message: null, success: null })
+                        const res = await triggerNavidromeScan()
+                        setScanStatus({
+                          running: false,
+                          message: res.success
+                            ? res.scanning
+                              ? "Navidrome scan initiated."
+                              : "Navidrome library is up to date."
+                            : res.error || "Failed to trigger scan.",
+                          success: res.success,
+                        })
+                      }}
+                      disabled={!isConnected || scanStatus.running}
+                      className="shrink-0 px-4 py-2 text-sm font-medium rounded-lg bg-zinc-100 dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                    >
+                      {scanStatus.running && <RefreshCw className="h-4 w-4 animate-spin" />}
+                      Scan Library
+                    </button>
+                  </div>
+
+                  {!isConnected && (
+                    <p className="mt-3 text-xs text-amber-600 dark:text-amber-400">
+                      Connect Navidrome to enable triggering scans.
+                    </p>
+                  )}
+
+                  {scanStatus.message && (
+                    <div
+                      className={`mt-3 rounded-md px-3 py-2 text-xs font-medium ${
+                        scanStatus.success
+                          ? "bg-green-50 dark:bg-green-950/40 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-900"
+                          : "bg-red-50 dark:bg-red-950/40 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-900"
+                      }`}
+                    >
+                      {scanStatus.message}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -547,9 +830,6 @@ function LayoutPreview({ id, highlighted }: LayoutPreviewProps) {
   const cellColor = highlighted
     ? "bg-green-500/70 dark:bg-green-400/70"
     : "bg-zinc-300 dark:bg-zinc-600"
-  const muted = highlighted
-    ? "bg-green-500/30 dark:bg-green-400/30"
-    : "bg-zinc-300/60 dark:bg-zinc-600/60"
 
   if (id === "default") {
     return (

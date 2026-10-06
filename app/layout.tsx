@@ -2,6 +2,7 @@ import type { Metadata } from "next"
 import { Geist, Geist_Mono } from "next/font/google"
 import "./globals.css"
 import { AuthProvider } from "@/lib/auth/auth-context"
+import { DownloaderProvider } from "@/lib/downloader/downloader-context"
 import { ToastProvider } from "@/components/Toast"
 import { SupportBubble } from "@/components/SupportBubble"
 
@@ -32,10 +33,12 @@ export default function RootLayout({
         className={`${geistSans.variable} ${geistMono.variable} antialiased dark`}
       >
         <AuthProvider>
-          <ToastProvider>
-            {children}
-            <SupportBubble />
-          </ToastProvider>
+          <DownloaderProvider>
+            <ToastProvider>
+              {children}
+              <SupportBubble />
+            </ToastProvider>
+          </DownloaderProvider>
         </AuthProvider>
       </body>
     </html>
